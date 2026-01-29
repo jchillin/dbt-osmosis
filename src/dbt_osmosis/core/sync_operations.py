@@ -11,6 +11,7 @@ if t.TYPE_CHECKING:
     from dbt_osmosis.core.dbt_protocols import YamlRefactorContextProtocol
 
 from dbt_osmosis.core import logger
+from dbt_osmosis.core.inheritance import _column_to_dict
 
 __all__ = [
     "_sync_doc_section",
@@ -79,7 +80,7 @@ def _sync_doc_section(
                 node.unique_id,
             )
             continue
-        cdict = meta.to_dict(omit_none=True)
+        cdict = _column_to_dict(meta, omit_none=True)
         # Filter out 'config' and 'doc_blocks' fields added in dbt-core >= 1.9.6
         # These contain redundant meta/tags that duplicate top-level fields
         cdict = {k: v for k, v in cdict.items() if k not in ("config", "doc_blocks")}

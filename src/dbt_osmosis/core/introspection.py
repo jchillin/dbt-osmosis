@@ -16,6 +16,7 @@ from pathlib import Path
 # pyright: reportPrivateImportUsage=false
 from dbt.adapters.base.column import Column as BaseColumn
 from dbt.adapters.base.relation import BaseRelation
+from dbt.adapters.exceptions.compilation import ApproximateMatchError
 from dbt.artifacts.schemas.catalog import CatalogArtifact, CatalogResults  # pyright: ignore[reportPrivateImportUsage]
 from dbt.contracts.graph.nodes import ResultNode  # pyright: ignore[reportPrivateImportUsage]
 from dbt_common.contracts.metadata import ColumnMetadata  # pyright: ignore[reportPrivateImportUsage]
@@ -1159,7 +1160,12 @@ def get_columns(
         def matches_relation(entry: t.Any) -> bool:
             if not callable(matcher):
                 return False
-            return bool(matcher(*entry.key()))
+            try:
+                return bool(matcher(*entry.key()))
+            except ApproximateMatchError:
+                # For Snowflake and other case-insensitive databases, an approximate
+                # match (case difference) IS the same relation, so treat as match
+                return True
 
         catalog_entry = _find_first(
             chain(catalog.nodes.values(), catalog.sources.values()),
