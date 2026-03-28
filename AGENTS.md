@@ -1,138 +1,203 @@
-# PROJECT KNOWLEDGE BASE
+# Repository Guidelines
 
-**Generated:** 2026-01-11 14:44:11
-**Commit:** (update on commit)
-**Branch:** (current branch)
+## Project Overview
 
-## OVERVIEW
-dbt-osmosis is a CLI tool for automated YAML schema management, column-level documentation inheritance, and interactive dbt SQL development via Streamlit workbench. Operates as both dbt utility and standalone Python package.
+`dbt-osmosis` is a Python CLI and package for dbt development workflows. The repo centers on four surfaces:
 
-## STRUCTURE
-```
-./
-├── src/dbt_osmosis/    # Main package (core, workbench, cli, sql)
-├── tests/                 # Pytest test suite (mirrors src structure)
-├── demo_duckdb/           # Demo dbt project (test fixture)
-└── docs/                  # Documentation site source
-```
+- schema YAML management (`yaml organize`, `yaml document`, `yaml refactor`)
+- column-level documentation inheritance across dbt lineage
+- ad-hoc SQL compile/run helpers
+- an optional Streamlit workbench for interactive dbt SQL development
 
-## WHERE TO LOOK
-| Task | Location | Notes |
-|------|----------|-------|
-| CLI entry | src/dbt_osmosis/cli/main.py | Click-based, yaml/sql/nl/workbench commands |
-| Core transforms | src/dbt_osmosis/core/transforms.py | Pipeline pattern with `>>` operator |
-| YAML handling | src/dbt_osmosis/core/schema/ | ruamel.yaml parsing/reading/writing |
-| Config resolution | src/dbt_osmosis/core/introspection.py:576 | SettingsResolver, PropertyAccessor |
-| Column inheritance | src/dbt_osmosis/core/inheritance.py:30 | Knowledge graph builder |
-| Workbench | src/dbt_osmosis/workbench/app.py | Streamlit app with modular components |
-| Public API | src/dbt_osmosis/core/osmosis.py | Re-exports for backwards compatibility |
+Other CLI families (`diff`, `lint`, `test`, `generate`, `nl`, `test-llm`) reuse the same project/bootstrap spine rather than defining separate runtimes.
 
-## CODE MAP
-| Symbol | Type | Location | Refs | Role |
-|--------|------|----------|------|------|
-| cli | Function | cli/main.py:48 | - | Entry point |
-| TransformPipeline | Class | core/transforms.py:86 | High | Operation chaining |
-| SettingsResolver | Class | core/introspection.py:576 | High | Config resolution |
-| PropertyAccessor | Class | core/introspection.py:1302 | High | Property access |
-| inherit_upstream_column_knowledge | Function | core/transforms.py:203 | High | Column docs propagation |
-| inject_missing_columns | Function | core/transforms.py:301 | High | Column injection |
-| _build_column_knowledge_graph | Function | core/inheritance.py:475 | High | Lineage graph |
+Primary entrypoint: `src/dbt_osmosis/cli/main.py`
+Package entrypoint: `src/dbt_osmosis/__main__.py`
 
-## CONVENTIONS
-- **Transform pipeline**: Chain with `>>` operator (e.g., `inject_missing >> inherit_docs`)
-- **ruamel.yaml**: Always use (NOT PyYAML) for formatting preservation
-- **Type hints**: `from __future__ import annotations` for forward references
-- **Pyright**: Some modules have suppressions (`# pyright: reportX=false`)
-- **Config precedence**: Column meta > Node meta > config.extra > config.meta > vars > fallback
+## Architecture & Data Flow
 
-## ANTI-PATTERNS (THIS PROJECT)
-- **NEVER** use PyYAML - use ruamel.yaml for formatting preservation
-- **NEVER** suppress type errors with `as any` - prefer proper types or suppressions
-- **NEVER** delete test files to "pass" - fix root cause
-- **NEVER** leave code in broken state - revert before continuing
-- **NEVER** use `_get_setting_for_node()` - deprecated, use SettingsResolver.resolve()
+### Main execution spine
+1. Click commands in `src/dbt_osmosis/cli/main.py` parse flags and build `DbtConfiguration`.
+2. `src/dbt_osmosis/core/config.py:create_dbt_project_context()` loads the dbt project, adapter, and manifest.
+3. YAML commands create `YamlRefactorContext` from `src/dbt_osmosis/core/settings.py`.
+4. Candidate nodes are filtered in `src/dbt_osmosis/core/node_filters.py`.
+5. Transform chains in `src/dbt_osmosis/core/transforms.py` mutate model/source metadata.
+6. YAML is read and written through `src/dbt_osmosis/core/schema/reader.py` and `writer.py`.
+7. `src/dbt_osmosis/core/sync_operations.py` merges manifest-backed truth back into schema files.
 
-## UNIQUE STYLES
-- **Unified config resolution**: SettingsResolver with 8-source precedence chain
-- **Column knowledge graph**: Directed graph for documentation lineage
-- **Transform pipeline**: Functional composition with operator overloading
-- **PropertyAccessor**: Unified interface for manifest/YAML properties with unrendered jinja support
-- **Thread-safe caching**: Global caches with dedicated locks (_COLUMN_LIST_CACHE, _YAML_BUFFER_CACHE)
+### Key architectural boundaries
+- `src/dbt_osmosis/core/introspection.py` is the configuration and property-resolution center. Prefer `SettingsResolver` and `PropertyAccessor` over ad hoc config lookups.
+- `src/dbt_osmosis/core/path_management.py` owns YAML routing and project-root safety checks.
+- `src/dbt_osmosis/core/inheritance.py` builds the column knowledge graph used for documentation inheritance.
+- `src/dbt_osmosis/core/sql_operations.py` is the shared SQL compile/execute path used by CLI, workbench, and proxy code.
+- `src/dbt_osmosis/core/schema/parser.py`, `reader.py`, and `writer.py` split YAML concerns deliberately: filter dbt-osmosis-owned sections, cache reads, then restore preserved sections on atomic write.
+- `src/dbt_osmosis/workbench/app.py` reuses the same dbt context but owns Streamlit state and dashboard composition.
 
-## COMMANDS
+### Public vs. internal surfaces
+- `src/dbt_osmosis/core/osmosis.py` and `src/dbt_osmosis/core/__init__.py` are compatibility facades. Do not put new core behavior there unless the API surface truly needs to expand.
+- Deep edits under `src/dbt_osmosis/core/` must also follow `src/dbt_osmosis/core/AGENTS.md`.
+
+## Key Directories
+
+- `src/dbt_osmosis/cli/` — Click command groups and user-facing entrypoints
+- `src/dbt_osmosis/core/` — dbt context setup, config resolution, transforms, YAML I/O, inheritance, plugins
+- `src/dbt_osmosis/core/schema/` — round-trip YAML parsing, caching, writing, validation
+- `src/dbt_osmosis/sql/` — SQL proxy and related helpers
+- `src/dbt_osmosis/workbench/` — Streamlit workbench and dashboard components
+- `tests/` — pytest suite; `tests/core/` mirrors core modules, root tests cover higher-level YAML behavior
+- `demo_duckdb/` — canonical dbt fixture project used by tests and examples
+- `docs/` — Docusaurus docs site; actual content lives under `docs/docs/`
+- `specs/001-unified-config-resolution/` — detailed spec/plan/quickstart for config-resolution work
+- `_deps/` — vendored dbt packages; avoid editing unless the task explicitly targets vendored code
+
+## Important Files
+
+| Path | Why it matters |
+| --- | --- |
+| `pyproject.toml` | Source of truth for Python support, dependencies, console script, Ruff, pytest, pyright |
+| `Taskfile.yml` | Canonical developer workflow (`task format`, `task lint`, `task test`, `task dev`) |
+| `.pre-commit-config.yaml` / `.pre-commit-hooks.yaml` | Repo hygiene policy plus packaged `dbt-osmosis yaml refactor -C` pre-commit hook contract |
+| `src/dbt_osmosis/cli/main.py` | Complete CLI surface: `yaml`, `sql`, `workbench`, `generate`, `nl`, `test`, `test-llm`, `lint`, `diff` |
+| `docs/package.json` / `docs/docusaurus.config.js` | Source of truth for docs-site tooling and Docusaurus 3 configuration |
+| `demo_duckdb/dbt_project.yml` / `demo_duckdb/dbt-osmosis.yml` | Best concrete examples of routing rules, config precedence, and YAML formatting defaults |
+| `src/dbt_osmosis/core/config.py` | dbt project/bootstrap and manifest loading |
+| `src/dbt_osmosis/core/settings.py` | `YamlRefactorContext`, formatter settings, catalog handling |
+| `src/dbt_osmosis/core/introspection.py` | `SettingsResolver`, `PropertyAccessor`, caches, config precedence |
+| `src/dbt_osmosis/core/schema/parser.py` / `reader.py` / `writer.py` | Canonical round-trip YAML filter/cache/preserve pipeline |
+| `src/dbt_osmosis/core/transforms.py` | `TransformPipeline` and main YAML mutation operations |
+| `src/dbt_osmosis/core/inheritance.py` | column lineage and inheritance logic |
+| `src/dbt_osmosis/core/sql_operations.py` | Shared SQL compile/execute helpers used outside just the CLI |
+| `src/dbt_osmosis/core/path_management.py` | YAML routing, source YAML bootstrapping, root-path validation |
+| `src/dbt_osmosis/workbench/app.py` | Streamlit workbench bootstrap and state initialization |
+| `tests/conftest.py` | expensive shared dbt fixture builders and `yaml_context` |
+| `tests/core/conftest.py` | ensures `demo_duckdb/target/manifest.json` exists before core tests |
+| `demo_duckdb/integration_tests.sh` | integration smoke sequence; resets fixture files with `git checkout`/`git clean` |
+
+## Development Commands
+
+Prefer `task` and `uv`; avoid ad hoc environment management.
+
 ```bash
-# Development
-task                    # Format, lint, dev setup, test
-task format               # Ruff format + import sort
-task lint                 # Ruff lint
-task test                 # Full test matrix
+# Setup / full local flow
+task dev
+task
 
-# dbt-osmosis
-uv run dbt-osmosis yaml refactor --project-dir <path> --profiles-dir <path>
-uv run dbt-osmosis yaml organize --project-dir <path> --profiles-dir <path>
-uv run dbt-osmosis yaml document --project-dir <path> --profiles-dir <path>
-uv run dbt-osmosis workbench --project-dir <path> --profiles-dir <path>
-uv run dbt-osmosis sql compile "SELECT..."
-uv run dbt-osmosis sql run "SELECT..."
-uv run dbt-osmosis nl query "Show me..."  # Natural language
-uv run dbt-osmosis nl generate "Model name..."  # Generate from NL
+# Formatting and linting
+task format
+task lint
+pre-commit run --all-files
+
+# Tests
+uv run dbt parse --project-dir demo_duckdb --profiles-dir demo_duckdb -t test
+uv run pytest
+task test
+
+# Focused test runs
+uv run pytest tests/core/test_cli.py
+uv run pytest tests/test_yaml_inheritance.py
+
+# CLI examples
+uv run dbt-osmosis yaml refactor --project-dir demo_duckdb --profiles-dir demo_duckdb
+uv run dbt-osmosis sql compile "select 1"
+uv run dbt-osmosis workbench --project-dir demo_duckdb --profiles-dir demo_duckdb
 ```
 
-## NOTES
-- **Large files**: introspection.py (58k), llm.py (63k), transforms.py (40k), config.py (24k), inheritance.py (23k)
-- **Caching**: Column lists in `_COLUMN_LIST_CACHE`, YAML buffers in `_YAML_BUFFER_CACHE` (both thread-safe)
-- **dbt integration**: Loads via `dbt.cli.main.dbtRunner`, accesses manifest at `target/manifest.json`
-- **Plugin system**: Pluggy-based with FuzzyCaseMatching, FuzzyPrefixMatching
-- **Test fixture**: demo_duckdb/ project, run `dbt parse` before tests
-- **Vendored deps**: _deps/ contains dbt packages (240MB, unusual for PyPI lib)
-- **Task runner**: Uses task (Taskfile.yml) instead of Make/nox
-- **uv.lock**: Modern package manager lockfile (uv-based)
+Docs site commands use the separate Node toolchain in `docs/`:
 
----
-
-## WORKBENCH (`src/dbt_osmosis/workbench/`)
-
-### OVERVIEW
-Streamlit-based interactive dbt development workbench with real-time compilation, query execution, and pandas profiling.
-
-### STRUCTURE
-```
-components/
-├── dashboard.py   # Dashboard.Item base class with drag-drop grid
-├── editor.py       # Monaco editor with SQL/YAML tabs
-├── renderer.py     # Read-only compiled SQL viewer
-├── preview.py      # Query results with DataGrid
-├── profiler.py     # ydata_profiling integration
-├── feed.py         # Hacker News RSS feed
-└── ai_assistant.py # AI documentation generation
+```bash
+npm --prefix docs run start
+npm --prefix docs run build
+npm --prefix docs run serve
 ```
 
-### WHERE TO LOOK
-| Task | Location | Notes |
-|------|----------|-------|
-| Entry point | app.py:296 | main() with state initialization |
-| State mgmt | app.py:300-320 | st.session_state.app SimpleNamespace |
-| Component init | app.py:303-314 | Dashboard items with grid positions |
-| Dashboard base | components/dashboard.py:24 | Dashboard.Item ABC |
-| Editor logic | components/editor.py:23 | Monaco with tab switching |
-| Query execution | app.py:248-273 | run_query() mutation state |
-| CLI launch | cli/main.py:824-876 | subprocess: streamlit run |
-| Hotkeys | app.py:376-379 | Ctrl+Enter (compile), Ctrl+Shift+Enter (run) |
+## Runtime & Tooling Preferences
 
-### CONVENTIONS (workbench-specific)
-- **Component inheritance**: All inherit from `Dashboard.Item`, implement `__call__()`
-- **State initialization**: Static `initial_state()` method for component state
-- **Grid positioning**: Components use (x, y, w, h) coordinates on dashboard grid
-- **Action callbacks**: Passed via constructor (compile_action, query_action, prof_action)
-- **Theme switching**: Each component has `_dark_mode` property, toggles via title bar
-- **Streamlit Elements**: Uses streamlit-elements-fluence (mui components) + dashboard.Grid
-- **Monaco editor**: Multiple tabs (SQL, YAML), language-aware syntax highlighting
-- **Hotkey bindings**: event.Hotkey() for keyboard shortcuts (Ctrl+Enter, Ctrl+Shift+Enter)
-- **Extra dependencies**: streamlit>=1.20.0,<1.42.0, streamlit-elements-fluence>=0.1.4, ydata-profiling~=4.13.0, feedparser~=6.0.12
+- Python: `>=3.10,<3.14`; local default is `.python-version` = `3.12`
+- Package manager / venv: `uv`
+- Build backend: `hatchling`
+- Formatter/linter/import sorter: Ruff is canonical, even though Black/isort config still exists in `pyproject.toml`
+- Test runner: `pytest`
+- Type checking: pyright only covers `src/dbt_osmosis/core` and `src/dbt_osmosis/cli`
+- Docs toolchain: Docusaurus 3 in `docs/`, Node `>=18`
+- Streamlit config exists in both `config.toml` and `.streamlit/config.toml`; check both before documenting runtime behavior
 
-### ANTI-PATTERNS (workbench-specific)
-- **NEVER** use st.session_state for component state - use st.session_state.app
-- **NEVER** use raw Streamlit widgets - use streamlit-elements-fluence dashboard
-- **NEVER** trigger unnecessary reruns - use lazy() for non-critical on_change handlers
-- **NEVER** create manual layouts - use Dashboard.Item with grid positioning
-- **NEVER** call st.rerun() in hotkey callbacks - use sync() or action lambdas
+Important nuance: `task` is not a pure verification command; it formats, lints, tests, and defers `task dev`.
+
+## Code Conventions & Common Patterns
+
+### YAML and schema handling
+- Use `ruamel.yaml` round-trip machinery in `src/dbt_osmosis/core/schema/`. Do not introduce new PyYAML-based schema editing.
+- Read/write schema files through the schema helpers, not manual file I/O. The reader/writer preserve non-osmosis sections and clear caches safely.
+- Atomic write behavior and preserved sections are part of the contract; bypassing them can silently lose YAML content.
+- Keep the parser/reader/writer split intact: parsing filters owned top-level sections, reads cache both filtered and original content, and writes merge preserved sections back before atomic replace.
+
+### Configuration resolution
+- New config logic should flow through `SettingsResolver.resolve()`.
+- Do not add new call sites for deprecated `_get_setting_for_node()`.
+- Respect the established precedence model documented in code and demo config:
+  - column meta
+  - node meta / dbt-osmosis options
+  - `config.extra`
+  - supplementary `dbt-osmosis.yml`
+  - `vars`
+  - fallback defaults
+
+### Transform and inheritance flow
+- YAML refactor behavior is pipeline-based; compose operations with `TransformPipeline` and the `>>` operator.
+- Column documentation inheritance belongs in `core/inheritance.py` and `core/transforms.py`, not in CLI glue.
+- Node selection and ordering should stay in `core/node_filters.py`, not scattered across callers.
+
+### Caching and concurrency
+- `_COLUMN_LIST_CACHE` and `_YAML_BUFFER_CACHE` are shared caches with lock/ownership expectations.
+- Do not bypass cache helpers or mutate cache state casually in production code.
+- Tests explicitly reset caches; keep new tests isolated when touching cache-sensitive code.
+
+### Workbench patterns
+- Workbench state belongs under `st.session_state.app`, not arbitrary top-level session keys.
+- Components inherit from `Dashboard.Item` and expose `initial_state()`.
+- Prefer `lazy()` for non-critical editor updates and `sync()`/explicit actions for compile-run flows.
+- Do not add raw Streamlit layout patterns when the existing dashboard system already covers the feature.
+
+### Optional AI paths
+- OpenAI-backed features are optional extras. Missing dependencies should fail clearly, not silently degrade.
+- The workbench AI assistant is still partially stubbed; do not assume it already performs real writeback or generation.
+
+## Testing & QA
+
+### Test layout
+- `tests/core/` mirrors `src/dbt_osmosis/core/` for focused unit coverage.
+- Root-level `tests/test_yaml_*.py` files exercise higher-level YAML, manifest, and inheritance behavior against a real dbt fixture.
+- CLI tests use `click.testing.CliRunner` and mostly validate command surfaces and help text.
+- There is no dedicated `tests/workbench/` suite today; workbench coverage is limited to CLI/smoke-level checks.
+
+### Fixture expectations
+- `demo_duckdb/` is the canonical integration fixture.
+- Many tests require `demo_duckdb/target/manifest.json`; generate it with `dbt parse` if missing.
+- `tests/conftest.py` builds temp DuckDB projects via `dbt seed`, `dbt run`, and `dbt docs generate`.
+- PostgreSQL coverage is optional and gated by `POSTGRES_URL`.
+- Some LLM-related paths are also optional and may skip when extras such as `openai` or `azure.identity` are unavailable.
+
+### QA cautions
+- dbt-version differences change manifest shape; avoid brittle assertions when adding tests.
+- Some tests mutate cwd or shared caches, so they are not automatically parallel-safe.
+- `task test` is expensive; for iterative work prefer targeted pytest runs after ensuring the manifest exists.
+- CI covers a broader dbt matrix than the local Taskfile.
+
+## Documentation & Demo Surfaces
+
+- Root `README.md` is a lightweight landing page, not the full reference.
+- Canonical CLI/config docs live in `docs/docs/`, especially `docs/docs/reference/cli.md` and the YAML workflow/configuration guides.
+- `docs/README.md` is boilerplate and currently stale; it still references Docusaurus 2 even though the site runs on Docusaurus 3.
+- The README intentionally omits some newer CLI families; use the Docusaurus CLI reference for `generate`, `nl`, and `test-llm` details.
+- `screenshots/` is illustrative only.
+- Generated/disposable artifacts include `docs/build/`, `demo_duckdb/target/`, `logs/`, and DuckDB database outputs.
+
+## Common Pitfalls
+
+- Do not document Black or isort as the active formatter; use Ruff.
+- Do not edit YAML files with plain string manipulation when schema helpers already exist.
+- Do not copy the few remaining PyYAML-style legacy paths into new schema-mutating code; round-trip YAML work belongs in `core/schema/`.
+- Do not bypass project-root path validation in `path_management.py`.
+- Do not run `demo_duckdb/integration_tests.sh` on a dirty tree you care about; it restores fixture paths with destructive git commands.
+- Do not assume README command coverage is complete; newer CLI families are documented in the Docusaurus reference.
+- Do not treat `core/osmosis.py` re-exports as the best place to implement new behavior.
