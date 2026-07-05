@@ -261,53 +261,121 @@ def _normalize_managed_quote_styles(
             description_indent=_nested_column_description_indent(path, indent_mapping),
         )
     if isinstance(value, dict):
-        for key, item in list(value.items()):
-            normalized_key = _normalize_managed_quote_styles(
-                key,
-                width=width,
-                prefix_colon=prefix_colon,
-                indent_mapping=indent_mapping,
-                path=path,
-            )
-            item_path = (*path, str(key)) if isinstance(key, str) else path
-            normalized_item = _normalize_managed_quote_styles(
-                item,
-                width=width,
-                prefix_colon=prefix_colon,
-                indent_mapping=indent_mapping,
-                path=item_path,
-            )
-            if normalized_key is not key or normalized_item is not item:
-                if isinstance(value, CommentedMap):
-                    index = list(value).index(key)
-                    del value[key]
-                    value.insert(index, normalized_key, normalized_item)
-                else:
-                    del value[key]
-                    value[normalized_key] = normalized_item
-    elif isinstance(value, CommentedSeq):
-        for index, item in enumerate(list(value)):
-            normalized = _normalize_managed_quote_styles(
-                item,
-                width=width,
-                prefix_colon=prefix_colon,
-                indent_mapping=indent_mapping,
-                path=(*path, "[]"),
-            )
-            if normalized is not item:
-                value[index] = normalized
-    elif isinstance(value, list):
-        for index, item in enumerate(value):
-            normalized = _normalize_managed_quote_styles(
-                item,
-                width=width,
-                prefix_colon=prefix_colon,
-                indent_mapping=indent_mapping,
-                path=(*path, "[]"),
-            )
-            if normalized is not item:
-                value[index] = normalized
+        _normalize_managed_mapping_quote_styles(
+            value,
+            width=width,
+            prefix_colon=prefix_colon,
+            indent_mapping=indent_mapping,
+            path=path,
+        )
+    elif isinstance(value, (CommentedSeq, list)):
+        _normalize_managed_sequence_quote_styles(
+            value,
+            width=width,
+            prefix_colon=prefix_colon,
+            indent_mapping=indent_mapping,
+            path=path,
+        )
     return value
+
+
+def _normalize_managed_mapping_quote_styles(
+    value: dict[t.Any, t.Any],
+    *,
+    width: int,
+    prefix_colon: str | None,
+    indent_mapping: int,
+    path: tuple[str, ...],
+) -> None:
+    for key, item in list(value.items()):
+        normalized_key = _normalize_managed_quote_styles(
+            key,
+            width=width,
+            prefix_colon=prefix_colon,
+            indent_mapping=indent_mapping,
+            path=path,
+        )
+        normalized_item = _normalize_managed_quote_styles(
+            item,
+            width=width,
+            prefix_colon=prefix_colon,
+            indent_mapping=indent_mapping,
+            path=_mapping_item_path(path, key),
+        )
+        if normalized_key is not key or normalized_item is not item:
+            _replace_mapping_item(value, key, normalized_key, normalized_item)
+
+
+def _mapping_item_path(path: tuple[str, ...], key: t.Any) -> tuple[str, ...]:
+    return (*path, str(key)) if isinstance(key, str) else path
+
+
+def _replace_mapping_item(
+    value: dict[t.Any, t.Any],
+    key: t.Any,
+    normalized_key: t.Any,
+    normalized_item: t.Any,
+) -> None:
+    if isinstance(value, CommentedMap):
+        index = list(value).index(key)
+        del value[key]
+        value.insert(index, normalized_key, normalized_item)
+        return
+
+    del value[key]
+    value[normalized_key] = normalized_item
+
+
+def _normalize_managed_sequence_quote_styles(
+    value: CommentedSeq | list[t.Any],
+    *,
+    width: int,
+    prefix_colon: str | None,
+    indent_mapping: int,
+    path: tuple[str, ...],
+) -> None:
+    for index, item in enumerate(list(value)):
+        normalized = _normalize_managed_quote_styles(
+            item,
+            width=width,
+            prefix_colon=prefix_colon,
+            indent_mapping=indent_mapping,
+            path=(*path, "[]"),
+        )
+        if normalized is not item:
+            value[index] = normalized
+
+
+def _load_unfiltered_yaml(path: Path) -> t.Any:
+    unfiltered_handler = ruamel.yaml.YAML()
+    unfiltered_handler.preserve_quotes = True
+    return unfiltered_handler.load(path)
+
+
+def _filtered_yaml_content(original_content: t.Any, yaml_handler: ruamel.yaml.YAML) -> t.Any:
+    if not isinstance(original_content, dict):
+        return original_content
+
+    filtered_content, _ = _partition_yaml_top_level_sections(original_content)
+    if not yaml_handler.preserve_quotes:
+        _normalize_managed_quote_styles(
+            filtered_content,
+            width=t.cast("int", yaml_handler.width),
+            prefix_colon=yaml_handler.prefix_colon,
+            indent_mapping=t.cast("int", yaml_handler.map_indent),
+        )
+    return filtered_content
+
+
+def _cache_yaml_content(path: Path, filtered_content: t.Any, original_content: t.Any) -> None:
+    _YAML_BUFFER_CACHE[path] = t.cast(
+        "dict[str, t.Any]",
+        filtered_content if filtered_content is not None else {},
+    )
+    _YAML_ORIGINAL_CACHE[path] = t.cast(
+        "dict[str, t.Any]",
+        original_content if original_content is not None else {},
+    )
 
 
 def _read_yaml(
@@ -336,30 +404,10 @@ def _read_yaml(
                 # preserved sections stay in the same ruamel object graph. This
                 # keeps cross-section anchors and aliases valid when the writer
                 # restores unmanaged sections.
-                unfiltered_handler = ruamel.yaml.YAML()
-                unfiltered_handler.preserve_quotes = True
-                original_content = unfiltered_handler.load(path)
-                if isinstance(original_content, dict):
-                    filtered_content, _ = _partition_yaml_top_level_sections(original_content)
-                    if not yaml_handler.preserve_quotes:
-                        _normalize_managed_quote_styles(
-                            filtered_content,
-                            width=t.cast("int", yaml_handler.width),
-                            prefix_colon=yaml_handler.prefix_colon,
-                            indent_mapping=t.cast("int", yaml_handler.map_indent),
-                        )
-                else:
-                    filtered_content = original_content
-
+                original_content = _load_unfiltered_yaml(path)
+                filtered_content = _filtered_yaml_content(original_content, yaml_handler)
                 # Store both filtered content (for processing) and original (for preservation)
-                _YAML_BUFFER_CACHE[path] = t.cast(
-                    "dict[str, t.Any]",
-                    filtered_content if filtered_content is not None else {},
-                )
-                _YAML_ORIGINAL_CACHE[path] = t.cast(
-                    "dict[str, t.Any]",
-                    original_content if original_content is not None else {},
-                )
+                _cache_yaml_content(path, filtered_content, original_content)
             except YAMLError as e:
                 logger.error(
                     ":boom: Failed to parse YAML file => %s: %s. "
