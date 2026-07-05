@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import importlib
 import os
@@ -24,11 +25,19 @@ from dbt_osmosis.core.config import (
     discover_project_dir,
 )
 from dbt_osmosis.core.diff import SchemaDiff
+from dbt_osmosis.core.discovery import (
+    DiscoveryResult,
+    discover_undocumented_columns,
+    discover_undocumented_models,
+)
 from dbt_osmosis.core.generators import (
+    DocumentationCheckResult,
+    check_documentation,
     generate_sources_from_database,
     generate_staging_from_source,
 )
 from dbt_osmosis.core.llm import generate_dbt_model_from_nl, generate_sql_from_nl
+from dbt_osmosis.core.migration import MigrationPlan, MigrationPlanner
 from dbt_osmosis.core.path_management import create_missing_source_yamls
 from dbt_osmosis.core.restructuring import (
     apply_restructure_plan,
@@ -54,6 +63,15 @@ from dbt_osmosis.core.transforms import (
     sort_columns_as_configured,
     synchronize_data_types,
     synthesize_missing_documentation_with_openai,
+)
+from dbt_osmosis.core.validation import (
+    ModelValidationStatus,
+    ValidationReport,
+    validate_models,
+)
+from dbt_osmosis.core.voice_learning import (
+    ProjectStyleProfile,
+    analyze_project_documentation_style,
 )
 
 T = t.TypeVar("T")
@@ -271,6 +289,64 @@ def _create_cli_project_context(
         **kwargs,
     )
     return create_dbt_project_context(settings)
+
+
+def _parsed_cli_vars(vars_value: str | None) -> dict[str, t.Any]:
+    parsed = yaml_handler.safe_load(vars_value) if vars_value else {}
+    if parsed is None:
+        return {}
+    if not isinstance(parsed, dict):
+        raise click.ClickException("--vars must parse to a YAML mapping.")
+    return t.cast("dict[str, t.Any]", parsed)
+
+
+def _create_cli_yaml_context(
+    *,
+    project_dir: str | None,
+    profiles_dir: str | None,
+    target: str | None,
+    profile: str | None = None,
+    threads: int | None = None,
+    vars_value: str | None = None,
+    disable_introspection: bool = False,
+    fqn: tuple[str, ...] = (),
+    models: tuple[str, ...] = (),
+    include_external: bool = False,
+    catalog_path: str | None = None,
+) -> YamlRefactorContext:
+    settings = DbtConfiguration(
+        project_dir=t.cast(str, project_dir),
+        profiles_dir=t.cast(str, profiles_dir),
+        target=target,
+        profile=profile,
+        threads=threads,
+        vars=_parsed_cli_vars(vars_value),
+        disable_introspection=disable_introspection,
+    )
+    return YamlRefactorContext(
+        project=create_dbt_project_context(settings),
+        settings=YamlRefactorSettings(
+            create_catalog_if_not_exists=False,
+            fqn=list(fqn),
+            models=list(models),
+            include_external=include_external,
+            catalog_path=catalog_path,
+        ),
+    )
+
+
+def _write_or_echo(text: str, output_path: str | None, *, label: str = "output") -> None:
+    if output_path:
+        Path(output_path).write_text(text, encoding="utf-8")
+        click.echo(f":white_check_mark: Wrote {label} to: {output_path}")
+        return
+    click.echo(text)
+
+
+def _json_text(data: t.Any) -> str:
+    import json
+
+    return json.dumps(data, indent=2, default=str)
 
 
 def yaml_opts(func: t.Callable[P, T]) -> t.Callable[P, T]:
@@ -1954,6 +2030,193 @@ def _output_diff_markdown(results: dict[str, t.Any], severity_filter: str) -> No
         _echo_diff_markdown_result(result, changes)
 
 
+@cli.group()
+def migration():
+    """Plan database migrations from schema diffs"""
+
+
+def _filtered_diff_results(
+    results: dict[str, t.Any],
+    severity_filter: str,
+) -> dict[str, t.Any]:
+    if severity_filter == "all":
+        return results
+    filtered_results = {}
+    for node_id, result in results.items():
+        changes = _diff_changes_for_severity(result, severity_filter)
+        if changes:
+            filtered_results[node_id] = dataclasses.replace(result, changes=changes)
+    return filtered_results
+
+
+def _migration_plan_summary(plan: MigrationPlan) -> dict[str, t.Any]:
+    return {
+        "node_id": plan.node_id,
+        "node_name": plan.node_name,
+        "total_steps": len(plan.steps),
+        "safe_steps": len(plan.safe_steps),
+        "breaking_steps": len(plan.breaking_steps),
+    }
+
+
+def _migration_plans_with_steps(plans: dict[str, MigrationPlan]) -> dict[str, MigrationPlan]:
+    return {node_id: plan for node_id, plan in plans.items() if plan.steps}
+
+
+def _render_migration_plans(
+    plans: dict[str, MigrationPlan],
+    output_format: str,
+    *,
+    include_rollback: bool,
+) -> str:
+    planned = _migration_plans_with_steps(plans)
+    if output_format == "json":
+        return _json_text({
+            "total_nodes": len(planned),
+            "plans": {node_id: plan.to_dict() for node_id, plan in planned.items()},
+        })
+
+    if not planned:
+        return ":white_check_mark: No migration steps generated"
+
+    if output_format == "markdown":
+        summary = "\n".join(
+            f"- `{plan.node_name}`: {len(plan.steps)} step(s), {len(plan.breaking_steps)} breaking"
+            for plan in planned.values()
+        )
+        plan_sections = "\n\n".join(plan.to_markdown() for plan in planned.values())
+        return f"# Migration Plans\n\n## Summary\n\n{summary}\n\n{plan_sections}"
+
+    header = "\n".join([
+        "-- dbt-osmosis migration plans",
+        *[
+            f"-- {item['node_name']}: {item['total_steps']} step(s), "
+            f"{item['breaking_steps']} breaking"
+            for item in (_migration_plan_summary(plan) for plan in planned.values())
+        ],
+        "",
+    ])
+    return header + "\n\n".join(
+        plan.to_sql(include_rollback=include_rollback) for plan in planned.values()
+    )
+
+
+@migration.command(context_settings=_CONTEXT, name="plan")
+@dbt_opts
+@logging_opts
+@click.argument("models", nargs=-1)
+@click.option(
+    "-f",
+    "--fqn",
+    multiple=True,
+    type=click.STRING,
+    help="Filter models by dbt fully qualified name.",
+)
+@click.option(
+    "--profile",
+    type=click.STRING,
+    help="Which profile to load. Overrides setting in dbt_project.yml.",
+)
+@click.option(
+    "--vars",
+    type=click.STRING,
+    help="Supply project variables as a YAML mapping.",
+)
+@click.option(
+    "--catalog-path",
+    type=click.Path(exists=True),
+    help="Read database columns from a catalog.json file instead of querying the warehouse.",
+)
+@click.option(
+    "--disable-introspection",
+    is_flag=True,
+    help="Load the project without live database introspection.",
+)
+@click.option(
+    "--include-external",
+    is_flag=True,
+    help="Include models and sources from external dbt packages.",
+)
+@click.option(
+    "--output-format",
+    type=click.Choice(["sql", "json", "markdown"], case_sensitive=False),
+    default="sql",
+    help="Output format for generated migration plans.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write the migration plan to a file instead of stdout.",
+)
+@click.option(
+    "--severity",
+    type=click.Choice(["safe", "moderate", "breaking", "all"], case_sensitive=False),
+    default="all",
+    help="Plan only schema changes at this severity.",
+)
+@click.option(
+    "--fuzzy-match-threshold",
+    type=click.FLOAT,
+    default=85.0,
+    help="Threshold for detecting column renames (0-100).",
+)
+@click.option(
+    "--detect-column-renames/--no-detect-column-renames",
+    default=True,
+    help="Enable or disable fuzzy matching for column rename detection.",
+)
+@click.option(
+    "--include-rollback/--no-rollback",
+    default=True,
+    help="Include rollback SQL comments in SQL output.",
+)
+def migration_plan_command(
+    target: str | None = None,
+    profile: str | None = None,
+    project_dir: str | None = None,
+    profiles_dir: str | None = None,
+    vars: str | None = None,
+    threads: int | None = None,
+    disable_introspection: bool = False,
+    fqn: tuple[str, ...] = (),
+    catalog_path: str | None = None,
+    include_external: bool = False,
+    output_format: str = "sql",
+    output: str | None = None,
+    severity: str = "all",
+    fuzzy_match_threshold: float = 85.0,
+    detect_column_renames: bool = True,
+    include_rollback: bool = True,
+    models: tuple[str, ...] = (),
+) -> None:
+    """Generate migration SQL, JSON, or Markdown from schema diff results."""
+    logger.info(":water_wave: Executing dbt-osmosis migration planning\n")
+    with _create_cli_yaml_context(
+        project_dir=project_dir,
+        profiles_dir=profiles_dir,
+        target=target,
+        profile=profile,
+        threads=threads,
+        vars_value=vars,
+        disable_introspection=disable_introspection,
+        fqn=fqn,
+        models=models,
+        include_external=include_external,
+        catalog_path=catalog_path,
+    ) as context:
+        differ = SchemaDiff(
+            t.cast(t.Any, context),
+            fuzzy_match_threshold=fuzzy_match_threshold,
+            detect_column_renames=detect_column_renames,
+        )
+        results = _filtered_diff_results(differ.compare_all(), severity)
+        plans = MigrationPlanner(t.cast(t.Any, context)).plan_for_results(results)
+
+    rendered = _render_migration_plans(plans, output_format, include_rollback=include_rollback)
+    _write_or_echo(rendered, output, label="migration plan")
+
+
 def _suggestion_ai_enabled(use_ai: bool, pattern_only: bool) -> bool:
     return use_ai and not pattern_only
 
@@ -2246,6 +2509,596 @@ def _output_as_table(results: dict[str, t.Any], output_path: str | None = None) 
         click.echo(f":white_check_mark: Wrote suggestions to: {output_path}")
     else:
         click.echo(output_text)
+
+
+@cli.group()
+def validate():
+    """Validate dbt models without materializing them"""
+
+
+def _selected_model_nodes(context: YamlRefactorContext) -> list[tuple[str, t.Any]]:
+    from dbt.artifacts.resources.types import NodeType
+
+    from dbt_osmosis.core.node_filters import _iter_candidate_nodes
+
+    return [
+        (uid, node)
+        for uid, node in _iter_candidate_nodes(context)
+        if getattr(node, "resource_type", None) == NodeType.Model
+    ]
+
+
+def _validation_result_dict(result: t.Any) -> dict[str, t.Any]:
+    return {
+        "model_name": result.model_name,
+        "unique_id": result.unique_id,
+        "status": result.status.value
+        if isinstance(result.status, ModelValidationStatus)
+        else str(result.status),
+        "error_message": result.error_message,
+        "execution_time_seconds": result.execution_time_seconds,
+        "row_count": result.row_count,
+        "bytes_processed": result.bytes_processed,
+    }
+
+
+def _validation_report_dict(report: ValidationReport) -> dict[str, t.Any]:
+    return {
+        "summary": {
+            "total_models": report.total_models,
+            "successful": report.successful,
+            "failed": report.failed,
+            "success_rate": report.get_success_rate(),
+            "total_execution_time": report.total_execution_time,
+        },
+        "results": [_validation_result_dict(result) for result in report.results],
+    }
+
+
+def _validation_report_text(report: ValidationReport) -> str:
+    lines = [
+        "Model validation summary",
+        f"  Total models: {report.total_models}",
+        f"  Successful: {report.successful}",
+        f"  Failed: {report.failed}",
+        f"  Success rate: {report.get_success_rate():.1f}%",
+        f"  Total execution time: {report.total_execution_time:.2f}s",
+    ]
+    for result in report.results:
+        status = (
+            result.status.value
+            if isinstance(result.status, ModelValidationStatus)
+            else str(result.status)
+        )
+        detail = f" ({result.error_message})" if result.error_message else ""
+        lines.append(
+            f"  - {result.model_name}: {status}, "
+            f"{result.execution_time_seconds:.2f}s, rows={result.row_count or 0}{detail}"
+        )
+    return "\n".join(lines)
+
+
+@validate.command(context_settings=_CONTEXT, name="models")
+@dbt_opts
+@logging_opts
+@click.argument("models", nargs=-1)
+@click.option(
+    "-f",
+    "--fqn",
+    multiple=True,
+    type=click.STRING,
+    help="Filter models by dbt fully qualified name.",
+)
+@click.option(
+    "--profile",
+    type=click.STRING,
+    help="Which profile to load. Overrides setting in dbt_project.yml.",
+)
+@click.option(
+    "--vars",
+    type=click.STRING,
+    help="Supply project variables as a YAML mapping.",
+)
+@click.option(
+    "--timeout",
+    type=click.FLOAT,
+    default=None,
+    help="Best-effort local timeout in seconds for each model query.",
+)
+@click.option(
+    "--include-external",
+    is_flag=True,
+    help="Include models from external dbt packages.",
+)
+@click.option(
+    "--quiet",
+    is_flag=True,
+    help="Suppress per-model validation progress logs.",
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format. Default is table.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write validation results to a file instead of stdout.",
+)
+def validate_models_command(
+    target: str | None = None,
+    profile: str | None = None,
+    project_dir: str | None = None,
+    profiles_dir: str | None = None,
+    vars: str | None = None,
+    threads: int | None = None,
+    fqn: tuple[str, ...] = (),
+    timeout: float | None = None,
+    include_external: bool = False,
+    quiet: bool = False,
+    format_name: str = "table",
+    output: str | None = None,
+    models: tuple[str, ...] = (),
+) -> None:
+    """Compile and execute selected models as validation queries."""
+    logger.info(":water_wave: Executing dbt-osmosis model validation\n")
+    with _create_cli_yaml_context(
+        project_dir=project_dir,
+        profiles_dir=profiles_dir,
+        target=target,
+        profile=profile,
+        threads=threads,
+        vars_value=vars,
+        fqn=fqn,
+        models=models,
+        include_external=include_external,
+    ) as context:
+        selected_models = _selected_model_nodes(context)
+        report = validate_models(
+            context.project,
+            selected_models,
+            timeout_seconds=timeout,
+            quiet=quiet,
+        )
+
+    rendered = (
+        _json_text(_validation_report_dict(report))
+        if format_name == "json"
+        else _validation_report_text(report)
+    )
+    _write_or_echo(rendered, output, label="validation results")
+    if report.failed:
+        sys.exit(1)
+
+
+@cli.group()
+def analyze():
+    """Analyze documentation coverage, gaps, and style"""
+
+
+def _documentation_column_coverage(result: DocumentationCheckResult) -> float:
+    if result.total_columns == 0:
+        return 100.0
+    return (result.documented_columns / result.total_columns) * 100
+
+
+def _gap_to_dict(gap: t.Any) -> dict[str, t.Any]:
+    if dataclasses.is_dataclass(gap) and not isinstance(gap, type):
+        return {field.name: getattr(gap, field.name) for field in dataclasses.fields(gap)}
+    if isinstance(gap, dict):
+        return gap
+    return {
+        name: getattr(gap, name)
+        for name in (
+            "model_name",
+            "column_name",
+            "resource_name",
+            "gap_type",
+            "description",
+            "message",
+            "priority",
+            "severity",
+        )
+        if hasattr(gap, name)
+    }
+
+
+def _documentation_check_dict(result: DocumentationCheckResult) -> dict[str, t.Any]:
+    return {
+        "total_models": result.total_models,
+        "models_with_descriptions": result.models_with_descriptions,
+        "models_without_descriptions": result.models_without_descriptions,
+        "total_columns": result.total_columns,
+        "documented_columns": result.documented_columns,
+        "undocumented_columns": result.undocumented_columns,
+        "column_coverage_percent": _documentation_column_coverage(result),
+        "gaps": [_gap_to_dict(gap) for gap in result.gaps],
+    }
+
+
+def _documentation_check_text(result: DocumentationCheckResult) -> str:
+    lines = [
+        "Documentation check summary",
+        f"  Models described: {result.models_with_descriptions}/{result.total_models}",
+        f"  Columns documented: {result.documented_columns}/{result.total_columns} "
+        f"({_documentation_column_coverage(result):.1f}%)",
+        f"  Gaps: {len(result.gaps)}",
+    ]
+    for gap in result.gaps[:20]:
+        gap_data = _gap_to_dict(gap)
+        description = gap_data.get("description") or gap_data.get("message") or str(gap)
+        lines.append(f"  - {description}")
+    return "\n".join(lines)
+
+
+@analyze.command(context_settings=_CONTEXT, name="docs")
+@dbt_opts
+@logging_opts
+@click.option(
+    "--profile",
+    type=click.STRING,
+    help="Which profile to load. Overrides setting in dbt_project.yml.",
+)
+@click.option(
+    "--vars",
+    type=click.STRING,
+    help="Supply project variables as a YAML mapping.",
+)
+@click.option(
+    "--model-filter",
+    type=click.STRING,
+    default=None,
+    help="Optional model name filter for documentation checking.",
+)
+@click.option(
+    "--min-model-length",
+    type=click.INT,
+    default=10,
+    help="Minimum model description length.",
+)
+@click.option(
+    "--min-column-length",
+    type=click.INT,
+    default=5,
+    help="Minimum column description length.",
+)
+@click.option(
+    "--min-column-coverage",
+    type=click.FLOAT,
+    default=100.0,
+    help="Minimum documented-column percentage required for exit zero.",
+)
+@click.option(
+    "--fail-on-gaps/--allow-gaps",
+    default=True,
+    help="Exit non-zero when documentation gaps are reported.",
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format. Default is table.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write documentation check results to a file instead of stdout.",
+)
+def analyze_docs_command(
+    target: str | None = None,
+    profile: str | None = None,
+    project_dir: str | None = None,
+    profiles_dir: str | None = None,
+    vars: str | None = None,
+    threads: int | None = None,
+    model_filter: str | None = None,
+    min_model_length: int = 10,
+    min_column_length: int = 5,
+    min_column_coverage: float = 100.0,
+    fail_on_gaps: bool = True,
+    format_name: str = "table",
+    output: str | None = None,
+) -> None:
+    """Check project documentation completeness."""
+    logger.info(":water_wave: Executing dbt-osmosis documentation check\n")
+    project = _create_cli_project_context(
+        project_dir,
+        profiles_dir,
+        target,
+        profile=profile,
+        threads=threads,
+        vars=_parsed_cli_vars(vars),
+    )
+    result = check_documentation(
+        project,
+        model_filter=model_filter,
+        min_model_length=min_model_length,
+        min_column_length=min_column_length,
+    )
+    rendered = (
+        _json_text(_documentation_check_dict(result))
+        if format_name == "json"
+        else _documentation_check_text(result)
+    )
+    _write_or_echo(rendered, output, label="documentation check results")
+    if _documentation_column_coverage(result) < min_column_coverage or (
+        fail_on_gaps and result.gaps
+    ):
+        sys.exit(1)
+
+
+def _style_profile_text(profile: ProjectStyleProfile) -> str:
+    lines = ["Documentation style profile"]
+    if profile.description_length_stats:
+        avg = profile.description_length_stats.get("avg_length", 0)
+        lines.append(f"  Average description length: {avg:.1f} words")
+    if profile.common_phrases:
+        phrases = ", ".join(phrase for phrase, _ in profile.common_phrases[:5])
+        lines.append(f"  Common phrases: {phrases}")
+    if profile.terminology_preferences:
+        terms = ", ".join(
+            f"{preferred} over {alternative}"
+            for preferred, alternative in list(profile.terminology_preferences.items())[:5]
+        )
+        lines.append(f"  Terminology: {terms}")
+    if profile.tone_markers:
+        tones = ", ".join(f"{name}: {count}" for name, count in profile.tone_markers.items())
+        lines.append(f"  Tone markers: {tones}")
+    lines.append(f"  Model examples: {len(profile.model_description_samples)}")
+    lines.append(f"  Column examples: {len(profile.column_description_samples)}")
+    return "\n".join(lines)
+
+
+@analyze.command(context_settings=_CONTEXT, name="style")
+@dbt_opts
+@logging_opts
+@click.argument("models", nargs=-1)
+@click.option(
+    "-f",
+    "--fqn",
+    multiple=True,
+    type=click.STRING,
+    help="Filter models by dbt fully qualified name.",
+)
+@click.option(
+    "--profile",
+    type=click.STRING,
+    help="Which profile to load. Overrides setting in dbt_project.yml.",
+)
+@click.option(
+    "--vars",
+    type=click.STRING,
+    help="Supply project variables as a YAML mapping.",
+)
+@click.option(
+    "--include-external",
+    is_flag=True,
+    help="Include models and sources from external dbt packages.",
+)
+@click.option(
+    "--max-nodes",
+    type=click.INT,
+    default=50,
+    help="Maximum number of nodes to analyze.",
+)
+@click.option(
+    "--max-columns-per-node",
+    type=click.INT,
+    default=10,
+    help="Maximum columns to analyze per node.",
+)
+@click.option(
+    "--max-examples",
+    type=click.INT,
+    default=3,
+    help="Maximum examples to include in prompt output.",
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(["table", "json", "prompt"]),
+    default="table",
+    help="Output format. Default is table.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write style analysis to a file instead of stdout.",
+)
+def analyze_style_command(
+    target: str | None = None,
+    profile: str | None = None,
+    project_dir: str | None = None,
+    profiles_dir: str | None = None,
+    vars: str | None = None,
+    threads: int | None = None,
+    fqn: tuple[str, ...] = (),
+    include_external: bool = False,
+    max_nodes: int = 50,
+    max_columns_per_node: int = 10,
+    max_examples: int = 3,
+    format_name: str = "table",
+    output: str | None = None,
+    models: tuple[str, ...] = (),
+) -> None:
+    """Analyze existing documentation style and examples."""
+    logger.info(":water_wave: Executing dbt-osmosis documentation style analysis\n")
+    with _create_cli_yaml_context(
+        project_dir=project_dir,
+        profiles_dir=profiles_dir,
+        target=target,
+        profile=profile,
+        threads=threads,
+        vars_value=vars,
+        fqn=fqn,
+        models=models,
+        include_external=include_external,
+    ) as context:
+        profile_result = analyze_project_documentation_style(
+            t.cast(t.Any, context),
+            max_nodes=max_nodes,
+            max_columns_per_node=max_columns_per_node,
+        )
+
+    if format_name == "json":
+        rendered = _json_text(dataclasses.asdict(profile_result))
+    elif format_name == "prompt":
+        rendered = profile_result.to_prompt_context(max_examples=max_examples)
+    else:
+        rendered = _style_profile_text(profile_result)
+    _write_or_echo(rendered, output, label="style analysis")
+
+
+def _discovery_result_text(label: str, result: DiscoveryResult, max_gaps: int) -> list[str]:
+    lines = [
+        f"{label} discovery summary",
+        f"  Coverage: {result.coverage_percent:.1f}%",
+        f"  Total gaps: {len(result.gaps)}",
+        f"  High priority: {len(result.high_priority_gaps)}",
+        f"  Medium priority: {len(result.medium_priority_gaps)}",
+        f"  Low priority: {len(result.low_priority_gaps)}",
+    ]
+    for gap in result.gaps[:max_gaps]:
+        lines.append(f"  - {gap.description} ({gap.priority:.1f}): {gap.reason}")
+    return lines
+
+
+@analyze.command(context_settings=_CONTEXT, name="discover")
+@dbt_opts
+@logging_opts
+@click.argument("models", nargs=-1)
+@click.option(
+    "-f",
+    "--fqn",
+    multiple=True,
+    type=click.STRING,
+    help="Filter models by dbt fully qualified name.",
+)
+@click.option(
+    "--profile",
+    type=click.STRING,
+    help="Which profile to load. Overrides setting in dbt_project.yml.",
+)
+@click.option(
+    "--vars",
+    type=click.STRING,
+    help="Supply project variables as a YAML mapping.",
+)
+@click.option(
+    "--include-external",
+    is_flag=True,
+    help="Include models and sources from external dbt packages.",
+)
+@click.option(
+    "--scope",
+    type=click.Choice(["models", "columns", "all"]),
+    default="all",
+    help="Documentation gap scope to discover.",
+)
+@click.option(
+    "--min-columns",
+    type=click.INT,
+    default=3,
+    help="Minimum model columns for model-level gap discovery.",
+)
+@click.option(
+    "--include-sources/--exclude-sources",
+    default=False,
+    help="Include source definitions in model-level discovery.",
+)
+@click.option(
+    "--min-priority",
+    type=click.FLOAT,
+    default=0.0,
+    help="Minimum column-gap priority to include.",
+)
+@click.option(
+    "--max-gaps",
+    type=click.INT,
+    default=20,
+    help="Maximum gaps to print in table output.",
+)
+@click.option(
+    "--check",
+    is_flag=True,
+    help="Exit non-zero when any selected discovery scope reports gaps.",
+)
+@click.option(
+    "--format",
+    "format_name",
+    type=click.Choice(["table", "json"]),
+    default="table",
+    help="Output format. Default is table.",
+)
+@click.option(
+    "-o",
+    "--output",
+    type=click.Path(),
+    help="Write discovery results to a file instead of stdout.",
+)
+def analyze_discover_command(
+    target: str | None = None,
+    profile: str | None = None,
+    project_dir: str | None = None,
+    profiles_dir: str | None = None,
+    vars: str | None = None,
+    threads: int | None = None,
+    fqn: tuple[str, ...] = (),
+    include_external: bool = False,
+    scope: str = "all",
+    min_columns: int = 3,
+    include_sources: bool = False,
+    min_priority: float = 0.0,
+    max_gaps: int = 20,
+    check: bool = False,
+    format_name: str = "table",
+    output: str | None = None,
+    models: tuple[str, ...] = (),
+) -> None:
+    """Discover prioritized documentation gaps."""
+    logger.info(":water_wave: Executing dbt-osmosis documentation discovery\n")
+    results: dict[str, DiscoveryResult] = {}
+    with _create_cli_yaml_context(
+        project_dir=project_dir,
+        profiles_dir=profiles_dir,
+        target=target,
+        profile=profile,
+        threads=threads,
+        vars_value=vars,
+        fqn=fqn,
+        models=models,
+        include_external=include_external,
+    ) as context:
+        typed_context = t.cast(t.Any, context)
+        if scope in ("models", "all"):
+            results["models"] = discover_undocumented_models(
+                typed_context,
+                min_columns=min_columns,
+                exclude_sources=not include_sources,
+            )
+        if scope in ("columns", "all"):
+            results["columns"] = discover_undocumented_columns(
+                typed_context,
+                min_priority=min_priority,
+            )
+
+    if format_name == "json":
+        rendered = _json_text({name: result.to_dict() for name, result in results.items()})
+    else:
+        lines: list[str] = []
+        for name, result in results.items():
+            lines.extend(_discovery_result_text(name.title(), result, max_gaps))
+            lines.append("")
+        rendered = "\n".join(lines).rstrip()
+    _write_or_echo(rendered, output, label="discovery results")
+    if check and any(result.gaps for result in results.values()):
+        sys.exit(1)
 
 
 @cli.group()

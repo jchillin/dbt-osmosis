@@ -1,6 +1,7 @@
 # pyright: reportPrivateImportUsage=false, reportPrivateUsage=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportAny=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportArgumentType=false, reportFunctionMemberAccess=false, reportUnknownVariableType=false, reportUnusedParameter=false
 
 import subprocess
+import typing as t
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -9,10 +10,18 @@ import pytest
 from click.testing import CliRunner
 
 from dbt_osmosis.cli.main import cli
-from dbt_osmosis.core.diff import SchemaDiffResult
+from dbt_osmosis.core.diff import ChangeCategory, ChangeSeverity, ColumnAdded, SchemaDiffResult
+from dbt_osmosis.core.discovery import DiscoveryResult, DocumentationGap
 from dbt_osmosis.core.exceptions import LLMConfigurationError
+from dbt_osmosis.core.generators import DocumentationCheckResult
 from dbt_osmosis.core.settings import YamlRefactorContext
 from dbt_osmosis.core.sql_lint import LintLevel, LintResult, LintViolation
+from dbt_osmosis.core.validation import (
+    ModelValidationResult,
+    ModelValidationStatus,
+    ValidationReport,
+)
+from dbt_osmosis.core.voice_learning import ProjectStyleProfile
 
 
 @pytest.fixture(scope="module")
@@ -30,6 +39,9 @@ def test_cli_group(runner: CliRunner) -> None:
     assert "sql" in result.output
     assert "test" in result.output
     assert "workbench" in result.output
+    assert "migration" in result.output
+    assert "validate" in result.output
+    assert "analyze" in result.output
 
 
 def test_yaml_group(runner: CliRunner) -> None:
@@ -49,6 +61,32 @@ def test_sql_group(runner: CliRunner) -> None:
     assert "Execute and compile dbt SQL statements" in result.output
     assert "run" in result.output
     assert "compile" in result.output
+
+
+def test_migration_group(runner: CliRunner) -> None:
+    """Test that the migration command group exposes plan generation."""
+    result = runner.invoke(cli, ["migration", "--help"])
+    assert result.exit_code == 0
+    assert "Plan database migrations" in result.output
+    assert "plan" in result.output
+
+
+def test_validate_group(runner: CliRunner) -> None:
+    """Test that the validate command group exposes model validation."""
+    result = runner.invoke(cli, ["validate", "--help"])
+    assert result.exit_code == 0
+    assert "Validate dbt models" in result.output
+    assert "models" in result.output
+
+
+def test_analyze_group(runner: CliRunner) -> None:
+    """Test that the analyze command group exposes documentation analysis."""
+    result = runner.invoke(cli, ["analyze", "--help"])
+    assert result.exit_code == 0
+    assert "Analyze documentation" in result.output
+    assert "docs" in result.output
+    assert "style" in result.output
+    assert "discover" in result.output
 
 
 def test_yaml_refactor_help(runner: CliRunner) -> None:
@@ -301,6 +339,244 @@ def test_diff_schema_preserves_unknown_positional_selector_for_empty_selection(
     assert compared_nodes == []
 
 
+def test_migration_plan_generates_sql_from_schema_diff(
+    runner: CliRunner,
+    yaml_context: YamlRefactorContext,
+) -> None:
+    """migration plan should expose MigrationPlanner through the CLI."""
+    node = yaml_context.project.manifest.nodes["model.jaffle_shop_duckdb.customers"]
+    diff_result = SchemaDiffResult(
+        node=node,
+        yaml_columns={},
+        database_columns={},
+        changes=[
+            ColumnAdded(
+                category=ChangeCategory.COLUMN_ADDED,
+                severity=ChangeSeverity.SAFE,
+                node=node,
+                description="",
+                column_name="new_metric",
+                data_type="INTEGER",
+            )
+        ],
+    )
+
+    with (
+        mock.patch(
+            "dbt_osmosis.cli.main.create_dbt_project_context",
+            return_value=yaml_context.project,
+        ),
+        mock.patch(
+            "dbt_osmosis.cli.main.SchemaDiff.compare_all",
+            return_value={node.unique_id: diff_result},
+        ),
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "migration",
+                "plan",
+                "--project-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "--profiles-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "customers",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "dbt-osmosis migration plans" in result.output
+    assert "ALTER TABLE" in result.output
+    assert "ADD COLUMN" in result.output
+    assert "new_metric" in result.output
+
+
+def test_validate_models_command_exits_nonzero_on_failed_validation(
+    runner: CliRunner,
+    yaml_context: YamlRefactorContext,
+) -> None:
+    """validate models should expose core validation and fail on failed results."""
+    report = ValidationReport()
+    report.add_result(
+        ModelValidationResult(
+            model_name="customers",
+            unique_id="model.jaffle_shop_duckdb.customers",
+            status=ModelValidationStatus.EXECUTION_ERROR,
+            error_message="relation missing",
+            execution_time_seconds=0.1,
+        )
+    )
+
+    with (
+        mock.patch(
+            "dbt_osmosis.cli.main.create_dbt_project_context",
+            return_value=yaml_context.project,
+        ),
+        mock.patch("dbt_osmosis.cli.main.validate_models", return_value=report) as validate_call,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "validate",
+                "models",
+                "--project-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "--profiles-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "customers",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "Model validation summary" in result.output
+    assert "Failed: 1" in result.output
+    selected_models = validate_call.call_args.args[1]
+    assert [node.name for _, node in selected_models] == ["customers"]
+
+
+def test_analyze_docs_exits_nonzero_when_coverage_threshold_fails(
+    runner: CliRunner,
+    yaml_context: YamlRefactorContext,
+) -> None:
+    """analyze docs should expose documentation checking with CI-friendly exits."""
+    doc_result = DocumentationCheckResult(
+        total_models=1,
+        models_with_descriptions=1,
+        models_without_descriptions=0,
+        total_columns=2,
+        documented_columns=1,
+        undocumented_columns=1,
+        gaps=[SimpleNamespace(description="Column customer_id is too short")],
+    )
+
+    with (
+        mock.patch(
+            "dbt_osmosis.cli.main.create_dbt_project_context",
+            return_value=yaml_context.project,
+        ),
+        mock.patch("dbt_osmosis.cli.main.check_documentation", return_value=doc_result) as check,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "analyze",
+                "docs",
+                "--project-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "--profiles-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "--model-filter",
+                "customers",
+                "--min-column-coverage",
+                "100",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "Documentation check summary" in result.output
+    assert "Columns documented: 1/2 (50.0%)" in result.output
+    assert check.call_args.kwargs["model_filter"] == "customers"
+
+
+def test_analyze_style_can_render_prompt_context(
+    runner: CliRunner,
+    yaml_context: YamlRefactorContext,
+) -> None:
+    """analyze style should expose the voice-learning profile as prompt context."""
+    profile = ProjectStyleProfile(
+        description_length_stats={"avg_length": 8.0, "min_length": 4.0, "max_length": 12.0},
+        common_phrases=[("customer identifier", 3)],
+        model_description_samples=["Customer dimension model"],
+        column_description_samples=["Unique customer identifier"],
+    )
+
+    with (
+        mock.patch(
+            "dbt_osmosis.cli.main.create_dbt_project_context",
+            return_value=yaml_context.project,
+        ),
+        mock.patch(
+            "dbt_osmosis.cli.main.analyze_project_documentation_style",
+            return_value=profile,
+        ) as analyze_call,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "analyze",
+                "style",
+                "--project-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "--profiles-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "--format",
+                "prompt",
+                "--max-examples",
+                "1",
+            ],
+        )
+
+    assert result.exit_code == 0
+    assert "Target description length: ~8 words" in result.output
+    assert "Customer dimension model" in result.output
+    assert analyze_call.call_args.kwargs["max_nodes"] == 50
+
+
+def test_analyze_discover_check_exits_nonzero_when_gaps_exist(
+    runner: CliRunner,
+    yaml_context: YamlRefactorContext,
+) -> None:
+    """analyze discover should expose prioritized documentation discovery."""
+    node = yaml_context.project.manifest.nodes["model.jaffle_shop_duckdb.customers"]
+    discovery_result = DiscoveryResult(
+        gaps=[
+            DocumentationGap(
+                node=node,
+                gap_type="missing",
+                description="Model has no description",
+                current_doc=None,
+                priority=75.0,
+                reason="Gap type: missing",
+            )
+        ],
+        total_models=1,
+        total_columns=3,
+        coverage_percent=0.0,
+        scan_time=mock.Mock(),
+        duration_seconds=0.01,
+    )
+
+    with (
+        mock.patch(
+            "dbt_osmosis.cli.main.create_dbt_project_context",
+            return_value=yaml_context.project,
+        ),
+        mock.patch(
+            "dbt_osmosis.cli.main.discover_undocumented_models",
+            return_value=discovery_result,
+        ) as discover_models,
+    ):
+        result = runner.invoke(
+            cli,
+            [
+                "analyze",
+                "discover",
+                "--project-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "--profiles-dir",
+                str(yaml_context.project.runtime_cfg.project_root),
+                "--scope",
+                "models",
+                "--check",
+            ],
+        )
+
+    assert result.exit_code == 1
+    assert "Models discovery summary" in result.output
+    assert "Model has no description" in result.output
+    discover_models.assert_called_once()
+
+
 def test_lint_file_passes_disabled_rules_and_does_not_duplicate_warning_output(
     runner: CliRunner,
     yaml_context: YamlRefactorContext,
@@ -434,7 +710,9 @@ def test_workbench_uses_streamlit_server_bind_flags_and_preserves_passthrough(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Workbench host/port should bind Streamlit's server, not browser defaults."""
-    completed = subprocess.CompletedProcess(args=[], returncode=0)
+    completed: subprocess.CompletedProcess[t.Any] = subprocess.CompletedProcess(
+        args=[], returncode=0
+    )
     monkeypatch.setattr("shutil.which", lambda name: "streamlit")
     monkeypatch.setattr("importlib.import_module", lambda name: object())
     with mock.patch.object(subprocess, "run", return_value=completed) as run:
@@ -469,7 +747,9 @@ def test_workbench_enable_external_feed_passes_app_opt_in(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """External RSS feed should require an explicit app-level opt-in."""
-    completed = subprocess.CompletedProcess(args=[], returncode=0)
+    completed: subprocess.CompletedProcess[t.Any] = subprocess.CompletedProcess(
+        args=[], returncode=0
+    )
     monkeypatch.setattr("shutil.which", lambda name: "streamlit")
     monkeypatch.setattr("importlib.import_module", lambda name: object())
     with mock.patch.object(subprocess, "run", return_value=completed) as run:
@@ -490,7 +770,9 @@ def test_workbench_uses_project_local_profiles_dir_when_omitted(
 ) -> None:
     """Workbench should pass the project-local profiles dir to the app when omitted."""
     project_dir = Path("demo_duckdb").resolve()
-    completed = subprocess.CompletedProcess(args=[], returncode=0)
+    completed: subprocess.CompletedProcess[t.Any] = subprocess.CompletedProcess(
+        args=[], returncode=0
+    )
     monkeypatch.setattr("shutil.which", lambda name: "streamlit")
     monkeypatch.setattr("importlib.import_module", lambda name: object())
 
@@ -518,7 +800,9 @@ def test_workbench_preserves_literal_double_dash_passthrough(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Click's literal -- pass-through should still become Streamlit args."""
-    completed = subprocess.CompletedProcess(args=[], returncode=0)
+    completed: subprocess.CompletedProcess[t.Any] = subprocess.CompletedProcess(
+        args=[], returncode=0
+    )
     monkeypatch.setattr("shutil.which", lambda name: "streamlit")
     monkeypatch.setattr("importlib.import_module", lambda name: object())
     with mock.patch.object(subprocess, "run", return_value=completed) as run:

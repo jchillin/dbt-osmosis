@@ -4,7 +4,7 @@ sidebar_position: 1
 
 # dbt-osmosis intro
 
-`dbt-osmosis` is a dbt developer workflow tool. Its primary job is schema YAML management, but the package also ships SQL helpers, a Streamlit workbench, schema diffing, SQL linting, test suggestions, and optional LLM-assisted generation paths.
+`dbt-osmosis` is a dbt developer workflow tool. Its primary job is schema YAML management, but the package also ships SQL helpers, a Streamlit workbench, schema diffing, migration planning, model validation, documentation analysis, SQL linting, test suggestions, and optional LLM-assisted generation paths.
 
 Use this page as the shortest truthful path from install to a safe first refactor. For the full command surface and detailed configuration behavior, follow the reference links at the end.
 
@@ -105,6 +105,9 @@ The current top-level command groups are:
 - `test`
 - `test-llm`
 - `diff`
+- `migration`
+- `validate`
+- `analyze`
 - `lint`
 
 ## Next reads

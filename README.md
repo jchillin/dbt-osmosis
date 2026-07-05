@@ -14,7 +14,7 @@ It centers on four primary surfaces:
 - ad-hoc SQL compile/run helpers
 - an optional Streamlit workbench for interactive dbt SQL development
 
-The repository also ships additional command families for generation, natural-language helpers, schema diffing, SQL linting, and test suggestions.
+The repository also ships additional command families for generation, natural-language helpers, schema diffing, migration planning, validation, documentation analysis, SQL linting, and test suggestions.
 
 The Docusaurus site is the canonical reference for the current CLI, configuration model, support matrix, and workflow guides:
 
@@ -99,6 +99,9 @@ Top-level commands currently exposed by `dbt-osmosis --help`:
 - `test` — suggest dbt tests
 - `test-llm` — validate LLM client configuration
 - `diff` — report schema drift between YAML and the database
+- `migration` — plan database migration SQL from schema diffs
+- `validate` — dry-run selected models without materializing them
+- `analyze` — inspect documentation coverage, gaps, and style
 - `lint` — lint SQL strings, models, or a whole project
 
 For command-by-command flags and examples, use the docs-site CLI reference rather than relying on this landing page.

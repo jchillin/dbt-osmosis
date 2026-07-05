@@ -18,6 +18,9 @@ This page documents the current `dbt-osmosis` CLI surface area as exposed by `db
 - `test` — suggest dbt tests
 - `test-llm` — validate LLM configuration
 - `diff` — compare YAML definitions with live database schema
+- `migration` — plan database migration SQL from schema diffs
+- `validate` — dry-run selected models without materializing them
+- `analyze` — inspect documentation coverage, gaps, and style
 - `lint` — lint SQL strings, models, or a whole project
 
 ## Shared dbt options
@@ -197,6 +200,61 @@ Important options:
 - `--detect-column-renames/--no-detect-column-renames`
 
 This command compares YAML definitions with live database schema and reports additions, removals, type changes, and fuzzy-matched renames.
+
+## `dbt-osmosis migration`
+
+Migration planning helpers.
+
+Currently exposed subcommand:
+
+- `dbt-osmosis migration plan [<model> ...]`
+
+Important options:
+
+- YAML selection flags (`[MODELS]`, `-f/--fqn`, `--include-external`)
+- `--catalog-path`
+- `--output-format [sql|json|markdown]`
+- `-o, --output`
+- `--severity [safe|moderate|breaking|all]`
+- `--fuzzy-match-threshold`
+- `--detect-column-renames/--no-detect-column-renames`
+- `--include-rollback/--no-rollback`
+
+This command runs schema diff detection and renders migration plans through the core migration planner. It does not execute migration SQL.
+
+## `dbt-osmosis validate`
+
+Validation helpers.
+
+Currently exposed subcommand:
+
+- `dbt-osmosis validate models [<model> ...]`
+
+Important options:
+
+- selection flags (`[MODELS]`, `-f/--fqn`, `--include-external`)
+- `--timeout`
+- `--quiet`
+- `--format [table|json]`
+- `-o, --output`
+
+This command compiles and executes selected models as validation queries without materializing tables or views. It exits non-zero when any selected model fails validation.
+
+## `dbt-osmosis analyze`
+
+Documentation analysis helpers.
+
+Exposed subcommands:
+
+- `dbt-osmosis analyze docs`
+- `dbt-osmosis analyze style [<model> ...]`
+- `dbt-osmosis analyze discover [<model> ...]`
+
+`analyze docs` checks documentation completeness through the dbt-core-interface documentation checker. It exits non-zero when gaps are reported or documented-column coverage is below `--min-column-coverage`, unless gaps are allowed with `--allow-gaps`.
+
+`analyze style` summarizes existing project documentation style and can emit table, JSON, or LLM prompt context output.
+
+`analyze discover` finds prioritized model-level and column-level documentation gaps. It reports gaps by default and exits non-zero only when `--check` is supplied.
 
 ## `dbt-osmosis lint`
 

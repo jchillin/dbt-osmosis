@@ -128,7 +128,7 @@ def test_workbench_requirements_reference_current_supported_extras() -> None:
         "idna>=3.15",
         "ipython>=8.10.0,<9",
         "pillow>=12.2.0",
-        "pyarrow>=17.0.0",
+        "pyarrow>=23.0.1",
     ):
         assert constraint in requirements
 
