@@ -100,6 +100,107 @@ def _generate_minimal_source_yaml(
     return {"name": node.source_name, "tables": [{"name": node.name, "columns": columns}]}
 
 
+def _find_restructure_node(
+    context: YamlRefactorContextProtocol,
+    uid: str,
+) -> ModelNode | SeedNode | SourceDefinition | None:
+    node = context.project.manifest.nodes.get(uid) or context.project.manifest.sources.get(uid)
+    return node if isinstance(node, (ModelNode, SeedNode, SourceDefinition)) else None
+
+
+def _new_file_operation(
+    context: YamlRefactorContextProtocol,
+    node: ModelNode | SeedNode | SourceDefinition,
+    file_path: Path,
+) -> RestructureOperation:
+    logger.info(":sparkles: No current YAML file, building minimal doc => %s", node.unique_id)
+    if isinstance(node, (ModelNode, SeedNode)):
+        minimal = _generate_minimal_model_yaml(node, fusion_compat=context.fusion_compat)
+        content = {"version": 2, f"{node.resource_type}s": [minimal]}
+    else:
+        minimal = _generate_minimal_source_yaml(node, fusion_compat=context.fusion_compat)
+        content = {"version": 2, "sources": [minimal]}
+    return RestructureOperation(file_path=file_path, content=content)
+
+
+def _empty_injectable_yaml() -> dict[str, t.Any]:
+    return {"version": 2, "models": [], "sources": [], "seeds": []}
+
+
+def _append_named_yaml_section(
+    injectable: dict[str, t.Any],
+    existing: dict[str, t.Any],
+    *,
+    section_name: str,
+    node_name: str,
+) -> None:
+    for obj in existing.get(section_name, []):
+        if obj["name"] == node_name:
+            injectable[section_name].append(obj)
+            break
+
+
+def _append_source_yaml_section(
+    injectable: dict[str, t.Any],
+    existing: dict[str, t.Any],
+    node: SourceDefinition,
+) -> None:
+    for src in existing.get("sources", []):
+        if src["name"] == node.source_name:
+            injectable["sources"].append(src)
+            break
+
+
+def _append_existing_yaml_resource(
+    injectable: dict[str, t.Any],
+    existing: dict[str, t.Any],
+    *,
+    node: ModelNode | SeedNode | SourceDefinition,
+    node_type: NodeType,
+) -> None:
+    if node_type == NodeType.Model:
+        assert isinstance(node, ModelNode)
+        _append_named_yaml_section(
+            injectable,
+            existing,
+            section_name="models",
+            node_name=node.name,
+        )
+    elif node_type == NodeType.Source:
+        assert isinstance(node, SourceDefinition)
+        _append_source_yaml_section(injectable, existing, node)
+    elif node_type == NodeType.Seed:
+        assert isinstance(node, SeedNode)
+        _append_named_yaml_section(
+            injectable,
+            existing,
+            section_name="seeds",
+            node_name=node.name,
+        )
+
+
+def _existing_file_operation(
+    context: YamlRefactorContextProtocol,
+    node: ModelNode | SeedNode | SourceDefinition,
+    loc: t.Any,
+) -> RestructureOperation:
+    from dbt_osmosis.core.schema.reader import _read_yaml
+
+    existing = _read_yaml(context.yaml_handler, context.yaml_handler_lock, loc.current)
+    injectable = _empty_injectable_yaml()
+    _append_existing_yaml_resource(
+        injectable,
+        existing,
+        node=node,
+        node_type=loc.node_type,
+    )
+    return RestructureOperation(
+        file_path=loc.target,
+        content=injectable,
+        superseded_paths={loc.current: [node]},
+    )
+
+
 def _create_operations_for_node(
     context: YamlRefactorContextProtocol,
     uid: str,
@@ -107,133 +208,103 @@ def _create_operations_for_node(
 ) -> list[RestructureOperation]:
     """Create restructure operations for a dbt model or source node."""
     logger.debug(":bricks: Creating restructure operations for => %s", uid)
-    node = context.project.manifest.nodes.get(uid) or context.project.manifest.sources.get(uid)
+    node = _find_restructure_node(context, uid)
     if not node:
         logger.warning(":warning: Node => %s not found in manifest.", uid)
         return []
 
-    # If loc.current is None => we are generating a brand new file
-    # If loc.current => we unify it with the new location
-    ops: list[RestructureOperation] = []
-
     if loc.current is None:
-        logger.info(":sparkles: No current YAML file, building minimal doc => %s", uid)
-        if isinstance(node, (ModelNode, SeedNode)):
-            minimal = _generate_minimal_model_yaml(node, fusion_compat=context.fusion_compat)
-            ops.append(
-                RestructureOperation(
-                    file_path=loc.target,
-                    content={"version": 2, f"{node.resource_type}s": [minimal]},
-                ),
-            )
-        else:
-            minimal = _generate_minimal_source_yaml(
-                t.cast("SourceDefinition", node),
-                fusion_compat=context.fusion_compat,
-            )
-            ops.append(
-                RestructureOperation(
-                    file_path=loc.target,
-                    content={"version": 2, "sources": [minimal]},
-                ),
-            )
-    else:
-        from dbt_osmosis.core.schema.reader import _read_yaml
-
-        existing = _read_yaml(context.yaml_handler, context.yaml_handler_lock, loc.current)
-        injectable: dict[str, t.Any] = {"version": 2}
-        injectable.setdefault("models", [])
-        injectable.setdefault("sources", [])
-        injectable.setdefault("seeds", [])
-        if loc.node_type == NodeType.Model:
-            assert isinstance(node, ModelNode)
-            for obj in existing.get("models", []):
-                if obj["name"] == node.name:
-                    injectable["models"].append(obj)
-                    break
-        elif loc.node_type == NodeType.Source:
-            assert isinstance(node, SourceDefinition)
-            for src in existing.get("sources", []):
-                if src["name"] == node.source_name:
-                    injectable["sources"].append(src)
-                    break
-        elif loc.node_type == NodeType.Seed:
-            assert isinstance(node, SeedNode)
-            for seed in existing.get("seeds", []):
-                if seed["name"] == node.name:
-                    injectable["seeds"].append(seed)
-        ops.append(
-            RestructureOperation(
-                file_path=loc.target,
-                content=injectable,
-                superseded_paths={loc.current: [node]},
-            ),
-        )
-    return ops
+        return [_new_file_operation(context, node, loc.target)]
+    return [_existing_file_operation(context, node, loc)]
 
 
-def draft_restructure_delta_plan(context: YamlRefactorContextProtocol) -> RestructureDeltaPlan:
-    """Draft a restructure plan for the dbt project."""
-    logger.info(":bulb: Drafting restructure delta plan for the project.")
-    plan = RestructureDeltaPlan()
-    lock = threading.Lock()
-
-    def _job(uid: str, loc: t.Any) -> None:
-        ops = _create_operations_for_node(context, uid, loc)
-        with lock:
-            plan.operations.extend(ops)
-
-    futs: list[Future[None]] = []
-    from dbt_osmosis.core.path_management import build_yaml_file_mapping
-
-    for uid, loc in build_yaml_file_mapping(context).items():
-        if not loc.is_valid:
-            futs.append(context.pool.submit(_job, uid, loc))
-    done, _ = wait(futs, return_when=FIRST_EXCEPTION)
+def _raise_first_plan_exception(done: set[Future[None]]) -> None:
     for fut in done:
         exc = fut.exception()
         if exc:
             logger.error(":bomb: Error encountered while drafting plan => %s", exc)
             raise exc
 
-    # Deduplicate operations by target file path
+
+def _collect_restructure_operations(
+    context: YamlRefactorContextProtocol,
+) -> list[RestructureOperation]:
+    from dbt_osmosis.core.path_management import build_yaml_file_mapping
+
+    operations: list[RestructureOperation] = []
+    lock = threading.Lock()
+
+    def _job(uid: str, loc: t.Any) -> None:
+        ops = _create_operations_for_node(context, uid, loc)
+        with lock:
+            operations.extend(ops)
+
+    futs = [
+        context.pool.submit(_job, uid, loc)
+        for uid, loc in build_yaml_file_mapping(context).items()
+        if not loc.is_valid
+    ]
+    done, _ = wait(futs, return_when=FIRST_EXCEPTION)
+    _raise_first_plan_exception(done)
+    return operations
+
+
+def _merge_resource_list(
+    existing_resources: list[t.Any],
+    incoming_resources: list[t.Any],
+    resource_type: str,
+) -> None:
+    if resource_type not in ("models", "seeds"):
+        existing_resources.extend(incoming_resources)
+        return
+
+    existing_by_name = {resource.get("name"): resource for resource in existing_resources}
+    for resource in incoming_resources:
+        if resource.get("name") not in existing_by_name:
+            existing_resources.append(resource)
+
+
+def _merge_operation_content(
+    existing_op: RestructureOperation,
+    incoming_op: RestructureOperation,
+) -> None:
+    for resource_type, resources in incoming_op.content.items():
+        existing_resources = existing_op.content.get(resource_type)
+        if existing_resources is None:
+            existing_op.content[resource_type] = resources
+        elif isinstance(resources, list) and isinstance(existing_resources, list):
+            _merge_resource_list(existing_resources, resources, resource_type)
+
+
+def _merge_superseded_paths(
+    existing_op: RestructureOperation,
+    incoming_op: RestructureOperation,
+) -> None:
+    for path, nodes in incoming_op.superseded_paths.items():
+        existing_op.superseded_paths.setdefault(path, []).extend(nodes)
+
+
+def _deduplicate_operations(
+    operations: list[RestructureOperation],
+) -> list[RestructureOperation]:
     deduplicated_ops: dict[Path, RestructureOperation] = {}
-    for op in plan.operations:
-        if op.file_path in deduplicated_ops:
-            # merge content rather than replacing
-            existing_op = deduplicated_ops[op.file_path]
-            for resource_type, resources in op.content.items():
-                if resource_type not in existing_op.content:
-                    existing_op.content[resource_type] = resources
-                elif isinstance(resources, list) and isinstance(
-                    existing_op.content[resource_type],
-                    list,
-                ):
-                    # for model lists, deduplicate by model name
-                    if resource_type in ("models", "seeds"):
-                        existing_models = {
-                            m.get("name"): m for m in existing_op.content[resource_type]
-                        }
-                        for model in resources:
-                            if model.get("name") in existing_models:
-                                # skip duplicate models - they're already included
-                                continue
-                            existing_op.content[resource_type].append(model)
-                    else:
-                        # for other types (like sources), just append
-                        existing_op.content[resource_type].extend(resources)
-
-            # merge superseded paths
-            for path, nodes in op.superseded_paths.items():
-                if path in existing_op.superseded_paths:
-                    existing_op.superseded_paths[path].extend(nodes)
-                else:
-                    existing_op.superseded_paths[path] = nodes
-        else:
+    for op in operations:
+        existing_op = deduplicated_ops.get(op.file_path)
+        if existing_op is None:
             deduplicated_ops[op.file_path] = op
+            continue
 
-    plan.operations = list(deduplicated_ops.values())
+        _merge_operation_content(existing_op, op)
+        _merge_superseded_paths(existing_op, op)
+    return list(deduplicated_ops.values())
 
+
+def draft_restructure_delta_plan(context: YamlRefactorContextProtocol) -> RestructureDeltaPlan:
+    """Draft a restructure plan for the dbt project."""
+    logger.info(":bulb: Drafting restructure delta plan for the project.")
+    plan = RestructureDeltaPlan(
+        operations=_deduplicate_operations(_collect_restructure_operations(context)),
+    )
     logger.info(":star2: Draft plan creation complete => %s operations", len(plan.operations))
     return plan
 
@@ -348,124 +419,191 @@ def _get_original_yaml_for_superseded_file(
     return original_data
 
 
-def apply_restructure_plan(
-    context: YamlRefactorContextProtocol,
-    plan: RestructureDeltaPlan,
-    *,
-    confirm: bool = False,
-) -> None:
-    """Apply the restructure plan for the dbt project."""
-    if not plan.operations:
-        logger.info(":white_check_mark: No changes needed in the restructure plan.")
-        return
+def _confirm_restructure_plan(plan: RestructureDeltaPlan, *, confirm: bool) -> bool:
+    if not confirm:
+        return True
 
-    if confirm:
-        logger.info(":warning: Confirm option set => printing plan and waiting for user input.")
-        pretty_print_plan(plan)
-
-    while confirm:
+    logger.info(":warning: Confirm option set => printing plan and waiting for user input.")
+    pretty_print_plan(plan)
+    while True:
         response = input("Apply the restructure plan? [y/N]: ")
         if response.lower() in ("y", "yes"):
-            break
+            return True
         if response.lower() in ("n", "no", ""):
             logger.info("Skipping restructure plan.")
-            return
+            return False
         logger.warning(":loudspeaker: Please respond with 'y' or 'n'.")
 
-    from dbt_osmosis.core.config import _reload_manifest
-    from dbt_osmosis.core.schema.reader import (
-        _YAML_BUFFER_CACHE_LOCK,
-        _discard_yaml_caches,
-        _read_yaml,
-    )
-    from dbt_osmosis.core.schema.writer import _write_yaml
 
-    starting_disk_mutations = getattr(context, "disk_mutation_count", 0)
-    written_file_tracker = getattr(context, "register_written_file", None)
-    register_disk_mutation = getattr(context, "register_disk_mutation", None)
+def _operation_output_doc(
+    context: YamlRefactorContextProtocol,
+    op: RestructureOperation,
+) -> dict[str, t.Any]:
+    from dbt_osmosis.core.schema.reader import _read_yaml
 
-    for op in plan.operations:
-        logger.debug(":arrow_right: Applying restructure operation => %s", op)
-        output_doc: dict[str, t.Any] = {"version": 2}
-        if op.file_path.exists():
-            existing_data = _read_yaml(
-                context.yaml_handler,
-                context.yaml_handler_lock,
-                op.file_path,
-            )
-            output_doc.update(existing_data or {})
-
-        for key, val in op.content.items():
-            if isinstance(val, list):
-                output_doc.setdefault(key, []).extend(val)
-            elif isinstance(val, dict):
-                output_doc.setdefault(key, {}).update(val)
-            else:
-                output_doc[key] = val
-
-        _write_yaml(
+    output_doc: dict[str, t.Any] = {"version": 2}
+    if op.file_path.exists():
+        existing_data = _read_yaml(
             context.yaml_handler,
             context.yaml_handler_lock,
             op.file_path,
-            output_doc,
-            context.settings.dry_run,
-            context.register_mutations,
-            context.settings.strip_eof_blank_lines,
+        )
+        output_doc.update(existing_data or {})
+    return output_doc
+
+
+def _merge_operation_into_doc(
+    output_doc: dict[str, t.Any],
+    content: dict[str, t.Any],
+) -> None:
+    for key, val in content.items():
+        if isinstance(val, list):
+            output_doc.setdefault(key, []).extend(val)
+        elif isinstance(val, dict):
+            output_doc.setdefault(key, {}).update(val)
+        else:
+            output_doc[key] = val
+
+
+def _write_restructure_operation(
+    context: YamlRefactorContextProtocol,
+    op: RestructureOperation,
+    *,
+    written_file_tracker: t.Callable[[Path], None] | None,
+) -> None:
+    from dbt_osmosis.core.schema.writer import _write_yaml
+
+    output_doc = _operation_output_doc(context, op)
+    _merge_operation_into_doc(output_doc, op.content)
+    _write_yaml(
+        context.yaml_handler,
+        context.yaml_handler_lock,
+        op.file_path,
+        output_doc,
+        context.settings.dry_run,
+        context.register_mutations,
+        context.settings.strip_eof_blank_lines,
+        written_file_tracker=written_file_tracker,
+    )
+
+
+def _remove_superseded_nodes(existing_data: dict[str, t.Any], nodes: list[ResultNode]) -> None:
+    if "models" in existing_data:
+        _remove_models(existing_data, nodes)
+    if "sources" in existing_data:
+        _remove_sources(existing_data, nodes)
+    if "seeds" in existing_data:
+        _remove_seeds(existing_data, nodes)
+
+
+def _delete_superseded_file(
+    context: YamlRefactorContextProtocol,
+    path: Path,
+    *,
+    register_disk_mutation: t.Callable[[], None] | None,
+) -> None:
+    from dbt_osmosis.core.schema.reader import _YAML_BUFFER_CACHE_LOCK, _discard_yaml_caches
+
+    if not context.settings.dry_run:
+        path.unlink(missing_ok=True)
+        if path.parent.exists() and not any(path.parent.iterdir()):
+            path.parent.rmdir()
+        with _YAML_BUFFER_CACHE_LOCK:
+            _discard_yaml_caches(path)
+        if callable(register_disk_mutation):
+            register_disk_mutation()
+    context.register_mutations(1)
+    logger.info(":heavy_minus_sign: Superseded entire file => %s", path)
+
+
+def _write_remaining_superseded_file(
+    context: YamlRefactorContextProtocol,
+    path: Path,
+    existing_data: dict[str, t.Any],
+    *,
+    op_file_path: Path,
+    written_file_tracker: t.Callable[[Path], None] | None,
+) -> None:
+    from dbt_osmosis.core.schema.writer import _write_yaml
+
+    _write_yaml(
+        context.yaml_handler,
+        context.yaml_handler_lock,
+        path,
+        existing_data,
+        context.settings.dry_run,
+        context.register_mutations,
+        context.settings.strip_eof_blank_lines,
+        written_file_tracker=written_file_tracker,
+    )
+    logger.info(":arrow_forward: Migrated doc from => %s to => %s", path, op_file_path)
+
+
+def _cleanup_superseded_file(
+    context: YamlRefactorContextProtocol,
+    *,
+    op_file_path: Path,
+    path: Path,
+    nodes: list[ResultNode],
+    written_file_tracker: t.Callable[[Path], None] | None,
+    register_disk_mutation: t.Callable[[], None] | None,
+) -> None:
+    from dbt_osmosis.core.schema.reader import _read_yaml
+
+    if path.resolve() == op_file_path.resolve():
+        logger.debug(":fast_forward: Skipping same-path superseded cleanup => %s", path)
+        return
+    if not path.is_file():
+        return
+
+    existing_data = _read_yaml(context.yaml_handler, context.yaml_handler_lock, path)
+    original_data = _get_original_yaml_for_superseded_file(context.yaml_handler_lock, path)
+    _remove_superseded_nodes(existing_data, nodes)
+    if not _has_remaining_superseded_content(existing_data, original_data):
+        _delete_superseded_file(
+            context,
+            path,
+            register_disk_mutation=register_disk_mutation,
+        )
+        return
+
+    _write_remaining_superseded_file(
+        context,
+        path,
+        existing_data,
+        op_file_path=op_file_path,
+        written_file_tracker=written_file_tracker,
+    )
+
+
+def _cleanup_superseded_paths(
+    context: YamlRefactorContextProtocol,
+    op: RestructureOperation,
+    *,
+    written_file_tracker: t.Callable[[Path], None] | None,
+    register_disk_mutation: t.Callable[[], None] | None,
+) -> None:
+    for path, nodes in op.superseded_paths.items():
+        _cleanup_superseded_file(
+            context,
+            op_file_path=op.file_path,
+            path=path,
+            nodes=nodes,
             written_file_tracker=written_file_tracker,
+            register_disk_mutation=register_disk_mutation,
         )
 
-        for path, nodes in op.superseded_paths.items():
-            if path.resolve() == op.file_path.resolve():
-                logger.debug(
-                    ":fast_forward: Skipping same-path superseded cleanup => %s",
-                    path,
-                )
-                continue
-            if path.is_file():
-                existing_data = _read_yaml(context.yaml_handler, context.yaml_handler_lock, path)
-                original_data = _get_original_yaml_for_superseded_file(
-                    context.yaml_handler_lock,
-                    path,
-                )
 
-                if "models" in existing_data:
-                    _remove_models(existing_data, nodes)
-                if "sources" in existing_data:
-                    _remove_sources(existing_data, nodes)
-                if "seeds" in existing_data:
-                    _remove_seeds(existing_data, nodes)
-
-                if not _has_remaining_superseded_content(existing_data, original_data):
-                    if not context.settings.dry_run:
-                        path.unlink(missing_ok=True)
-                        if path.parent.exists() and not any(path.parent.iterdir()):
-                            path.parent.rmdir()
-                        with _YAML_BUFFER_CACHE_LOCK:
-                            _discard_yaml_caches(path)
-                        if callable(register_disk_mutation):
-                            register_disk_mutation()
-                    context.register_mutations(1)
-                    logger.info(":heavy_minus_sign: Superseded entire file => %s", path)
-                else:
-                    _write_yaml(
-                        context.yaml_handler,
-                        context.yaml_handler_lock,
-                        path,
-                        existing_data,
-                        context.settings.dry_run,
-                        context.register_mutations,
-                        context.settings.strip_eof_blank_lines,
-                        written_file_tracker=written_file_tracker,
-                    )
-                    logger.info(
-                        ":arrow_forward: Migrated doc from => %s to => %s",
-                        path,
-                        op.file_path,
-                    )
-
-    logger.info(":arrows_counterclockwise: Committing any buffered restructure changes.")
+def _commit_restructure_changes(
+    context: YamlRefactorContextProtocol,
+    *,
+    starting_disk_mutations: int,
+    written_file_tracker: t.Callable[[Path], None] | None,
+) -> None:
+    from dbt_osmosis.core.config import _reload_manifest
     from dbt_osmosis.core.schema.writer import commit_yamls
 
+    logger.info(":arrows_counterclockwise: Committing any buffered restructure changes.")
     commit_yamls(
         context.yaml_handler,
         context.yaml_handler_lock,
@@ -477,3 +615,41 @@ def apply_restructure_plan(
     if getattr(context, "disk_mutation_count", starting_disk_mutations) > starting_disk_mutations:
         logger.info(":arrows_counterclockwise: Reloading the dbt project manifest.")
         _reload_manifest(context.project)
+
+
+def apply_restructure_plan(
+    context: YamlRefactorContextProtocol,
+    plan: RestructureDeltaPlan,
+    *,
+    confirm: bool = False,
+) -> None:
+    """Apply the restructure plan for the dbt project."""
+    if not plan.operations:
+        logger.info(":white_check_mark: No changes needed in the restructure plan.")
+        return
+
+    if not _confirm_restructure_plan(plan, confirm=confirm):
+        return
+
+    starting_disk_mutations = getattr(context, "disk_mutation_count", 0)
+    written_file_tracker = getattr(context, "register_written_file", None)
+    register_disk_mutation = getattr(context, "register_disk_mutation", None)
+
+    for op in plan.operations:
+        logger.debug(":arrow_right: Applying restructure operation => %s", op)
+        _write_restructure_operation(
+            context,
+            op,
+            written_file_tracker=written_file_tracker,
+        )
+        _cleanup_superseded_paths(
+            context,
+            op,
+            written_file_tracker=written_file_tracker,
+            register_disk_mutation=register_disk_mutation,
+        )
+    _commit_restructure_changes(
+        context,
+        starting_disk_mutations=starting_disk_mutations,
+        written_file_tracker=written_file_tracker,
+    )
