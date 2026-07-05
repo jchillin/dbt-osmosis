@@ -89,17 +89,7 @@ def _call_with_retry(func, max_retries=5, initial_delay=1.0):
             if attempt == max_retries:
                 raise
 
-            wait_time = delay
-            response = getattr(e, "response", None)
-            if response:
-                retry_after = response.headers.get("retry-after")
-                if retry_after:
-                    try:
-                        wait_time = float(retry_after)
-                    except ValueError:
-                        # Keep exponential backoff when the server sends a malformed header.
-                        pass
-
+            wait_time = _retry_wait_time(e, delay)
             time.sleep(wait_time)
             delay *= 2  # Exponential backoff
         except Exception:
@@ -109,6 +99,25 @@ def _call_with_retry(func, max_retries=5, initial_delay=1.0):
     if last_exception:
         raise last_exception
     raise RuntimeError("Unexpected retry loop completion without exception")
+
+
+def _retry_wait_time(error: Exception, fallback_delay: float) -> float:
+    retry_after = _retry_after_header(error)
+    if not retry_after:
+        return fallback_delay
+
+    try:
+        return float(retry_after)
+    except ValueError:
+        # Keep exponential backoff when the server sends a malformed header.
+        return fallback_delay
+
+
+def _retry_after_header(error: Exception) -> str | None:
+    response = getattr(error, "response", None)
+    if not response:
+        return None
+    return response.headers.get("retry-after")
 
 
 __all__ = [
@@ -182,6 +191,187 @@ def _normalize_azure_ad_token_scope(scope: str) -> str:
     return normalized
 
 
+def _openai_client_class() -> t.Any:
+    assert OpenAI is not None
+    return OpenAI
+
+
+def _azure_openai_client_class() -> t.Any:
+    assert AzureOpenAI is not None
+    return AzureOpenAI
+
+
+def _build_openai_client() -> tuple[t.Any, str]:
+    openai_api_key = os.getenv("OPENAI_API_KEY")
+    if not openai_api_key:
+        raise LLMConfigurationError("OPENAI_API_KEY not set for OpenAI provider")
+    return _openai_client_class()(api_key=openai_api_key), os.getenv("OPENAI_MODEL", "gpt-4o")
+
+
+def _build_azure_openai_client() -> tuple[t.Any, str]:
+    azure_endpoint = os.getenv("AZURE_OPENAI_BASE_URL")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+    api_key = os.getenv("AZURE_OPENAI_API_KEY")
+    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+
+    if not (azure_endpoint and deployment_name):
+        raise LLMConfigurationError(
+            "AZURE_OPENAI_BASE_URL and AZURE_OPENAI_DEPLOYMENT_NAME must be set for azure-openai provider",
+        )
+
+    if not api_key:
+        raise LLMConfigurationError("AZURE_OPENAI_API_KEY must be set for azure-openai provider")
+
+    return (
+        _azure_openai_client_class()(
+            azure_endpoint=azure_endpoint,
+            api_key=api_key,
+            api_version=api_version,
+        ),
+        deployment_name,
+    )
+
+
+def _build_azure_openai_ad_client() -> tuple[t.Any, str]:
+    azure_endpoint = os.getenv("AZURE_OPENAI_BASE_URL")
+    deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
+    api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
+    azure_ad_token_scope = os.getenv("AZURE_OPENAI_AD_TOKEN_SCOPE")
+
+    if not (azure_endpoint and deployment_name):
+        raise LLMConfigurationError(
+            "AZURE_OPENAI_BASE_URL and AZURE_OPENAI_DEPLOYMENT_NAME must be set for azure-openai-ad provider",
+        )
+
+    if not azure_ad_token_scope:
+        raise LLMConfigurationError(
+            "AZURE_OPENAI_AD_TOKEN_SCOPE must be set for azure-openai-ad provider"
+        )
+
+    return (
+        _azure_openai_client_class()(
+            azure_endpoint=azure_endpoint,
+            azure_ad_token=_azure_ad_token(_normalize_azure_ad_token_scope(azure_ad_token_scope)),
+            api_version=api_version,
+        ),
+        deployment_name,
+    )
+
+
+def _azure_ad_token(normalized_scope: str) -> str:
+    if not _AZURE_IDENTITY_AVAILABLE:
+        raise LLMConfigurationError(
+            "Azure Identity library is not installed. "
+            "Please install it with: pip install 'dbt-osmosis[azure]' or pip install azure-identity"
+        )
+
+    assert EnvironmentCredential is not None
+    assert DefaultAzureCredential is not None
+
+    try:
+        return _azure_ad_credential().get_token(normalized_scope).token
+    except Exception as e:
+        raise LLMConfigurationError(
+            f"Failed to acquire Azure AD token: {_redact_credentials(str(e))}"
+        ) from e
+
+
+def _azure_ad_credential() -> t.Any:
+    assert EnvironmentCredential is not None
+    assert DefaultAzureCredential is not None
+
+    azure_tenant_id = os.getenv("AZURE_TENANT_ID")
+    azure_client_id = os.getenv("AZURE_CLIENT_ID")
+    azure_client_secret = os.getenv("AZURE_CLIENT_SECRET")
+
+    if azure_tenant_id and azure_client_id and azure_client_secret:
+        return EnvironmentCredential()  # type: ignore[misc]
+    return DefaultAzureCredential()  # type: ignore[misc]
+
+
+def _build_openai_compatible_client(
+    *,
+    base_url: str,
+    api_key: str | None,
+    model_engine: str,
+    missing_key_message: str | None = None,
+) -> tuple[t.Any, str]:
+    client = _openai_client_class()(base_url=base_url, api_key=api_key)
+    if missing_key_message and not client.api_key:
+        raise LLMConfigurationError(missing_key_message)
+    return client, model_engine
+
+
+def _build_lm_studio_client() -> tuple[t.Any, str]:
+    return _build_openai_compatible_client(
+        base_url=os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
+        api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
+        model_engine=os.getenv("LM_STUDIO_MODEL", "local-model"),
+    )
+
+
+def _build_ollama_client() -> tuple[t.Any, str]:
+    return _build_openai_compatible_client(
+        base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
+        api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
+        model_engine=os.getenv("OLLAMA_MODEL", "llama2:latest"),
+    )
+
+
+def _build_google_gemini_client() -> tuple[t.Any, str]:
+    return _build_openai_compatible_client(
+        base_url=os.getenv(
+            "GOOGLE_GEMINI_BASE_URL",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+        ),
+        api_key=os.getenv("GOOGLE_GEMINI_API_KEY"),
+        model_engine=os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.0-flash"),
+        missing_key_message=(
+            "GEMINI environment variables GOOGLE_GEMINI_API_KEY not set for google-gemini provider"
+        ),
+    )
+
+
+def _build_anthropic_client() -> tuple[t.Any, str]:
+    return _build_openai_compatible_client(
+        base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
+        api_key=os.getenv("ANTHROPIC_API_KEY"),
+        model_engine=os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest"),
+        missing_key_message=(
+            "Anthropic environment variables ANTHROPIC_API_KEY not set for anthropic provider"
+        ),
+    )
+
+
+def _llm_provider_builders() -> dict[str, t.Callable[[], tuple[t.Any, str]]]:
+    return {
+        "openai": _build_openai_client,
+        "azure-openai": _build_azure_openai_client,
+        "azure-openai-ad": _build_azure_openai_ad_client,
+        "lm-studio": _build_lm_studio_client,
+        "ollama": _build_ollama_client,
+        "google-gemini": _build_google_gemini_client,
+        "anthropic": _build_anthropic_client,
+    }
+
+
+def _build_llm_client_for_provider(provider: str) -> tuple[t.Any, str]:
+    try:
+        return _llm_provider_builders()[provider]()
+    except KeyError as e:
+        raise LLMConfigurationError(
+            f"Invalid LLM provider '{provider}'. Valid options: openai, azure-openai, azure-openai-ad, google-gemini, anthropic, lm-studio, ollama.",
+        ) from e
+
+
+def _raise_missing_provider_env_vars(provider: str) -> None:
+    missing_vars = [var for var in _LLM_PROVIDER_REQUIRED_ENV_VARS[provider] if not os.getenv(var)]
+    if missing_vars:
+        raise LLMConfigurationError(
+            f"ERROR: Missing environment variables for {provider}: {', '.join(missing_vars)}. Please refer to the documentation to set them correctly.",
+        )
+
+
 # Dynamic client creation function
 def get_llm_client() -> tuple[t.Any, str]:
     """Creates and returns an LLM client and model engine string based on environment variables.
@@ -199,143 +389,9 @@ def get_llm_client() -> tuple[t.Any, str]:
             "pip install 'dbt-osmosis[openai]' or pip install openai"
         )
 
-    # Type narrowing: after availability check, these cannot be None
-    assert OpenAI is not None
-    assert AzureOpenAI is not None
-
     provider = os.getenv("LLM_PROVIDER", "openai").lower()
-
-    if provider == "openai":
-        openai_api_key = os.getenv("OPENAI_API_KEY")
-        if not openai_api_key:
-            raise LLMConfigurationError("OPENAI_API_KEY not set for OpenAI provider")
-        client = OpenAI(api_key=openai_api_key)
-        model_engine = os.getenv("OPENAI_MODEL", "gpt-4o")
-
-    elif provider == "azure-openai":
-        azure_endpoint = os.getenv("AZURE_OPENAI_BASE_URL")
-        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
-        api_key = os.getenv("AZURE_OPENAI_API_KEY")
-        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-
-        if not (azure_endpoint and deployment_name):
-            raise LLMConfigurationError(
-                "AZURE_OPENAI_BASE_URL and AZURE_OPENAI_DEPLOYMENT_NAME must be set for azure-openai provider",
-            )
-        model_engine = deployment_name
-
-        if not api_key:
-            raise LLMConfigurationError(
-                "AZURE_OPENAI_API_KEY must be set for azure-openai provider"
-            )
-
-        client = AzureOpenAI(
-            azure_endpoint=azure_endpoint,
-            api_key=api_key,
-            api_version=api_version,
-        )
-
-    elif provider == "azure-openai-ad":
-        azure_endpoint = os.getenv("AZURE_OPENAI_BASE_URL")
-        deployment_name = os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME")
-        api_version = os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview")
-        azure_ad_token_scope = os.getenv("AZURE_OPENAI_AD_TOKEN_SCOPE")
-
-        if not (azure_endpoint and deployment_name):
-            raise LLMConfigurationError(
-                "AZURE_OPENAI_BASE_URL and AZURE_OPENAI_DEPLOYMENT_NAME must be set for azure-openai-ad provider",
-            )
-        model_engine = deployment_name
-
-        if not azure_ad_token_scope:
-            raise LLMConfigurationError(
-                "AZURE_OPENAI_AD_TOKEN_SCOPE must be set for azure-openai-ad provider"
-            )
-
-        normalized_scope = _normalize_azure_ad_token_scope(azure_ad_token_scope)
-
-        if not _AZURE_IDENTITY_AVAILABLE:
-            raise LLMConfigurationError(
-                "Azure Identity library is not installed. "
-                "Please install it with: pip install 'dbt-osmosis[azure]' or pip install azure-identity"
-            )
-
-        assert EnvironmentCredential is not None
-        assert DefaultAzureCredential is not None
-
-        try:
-            azure_tenant_id = os.getenv("AZURE_TENANT_ID")
-            azure_client_id = os.getenv("AZURE_CLIENT_ID")
-            azure_client_secret = os.getenv("AZURE_CLIENT_SECRET")
-
-            if azure_tenant_id and azure_client_id and azure_client_secret:
-                credential = EnvironmentCredential()  # type: ignore[misc]
-                token = credential.get_token(normalized_scope).token
-            else:
-                credential = DefaultAzureCredential()  # type: ignore[misc]
-                token = credential.get_token(normalized_scope).token
-        except Exception as e:
-            raise LLMConfigurationError(
-                f"Failed to acquire Azure AD token: {_redact_credentials(str(e))}"
-            ) from e
-
-        client = AzureOpenAI(
-            azure_endpoint=azure_endpoint,
-            azure_ad_token=token,
-            api_version=api_version,
-        )
-
-    elif provider == "lm-studio":
-        client = OpenAI(
-            base_url=os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1"),
-            api_key=os.getenv("LM_STUDIO_API_KEY", "lm-studio"),
-        )
-        model_engine = os.getenv("LM_STUDIO_MODEL", "local-model")
-
-    elif provider == "ollama":
-        client = OpenAI(
-            base_url=os.getenv("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
-            api_key=os.getenv("OLLAMA_API_KEY", "ollama"),
-        )
-        model_engine = os.getenv("OLLAMA_MODEL", "llama2:latest")
-
-    elif provider == "google-gemini":
-        client = OpenAI(
-            base_url=os.getenv(
-                "GOOGLE_GEMINI_BASE_URL",
-                "https://generativelanguage.googleapis.com/v1beta/openai",
-            ),
-            api_key=os.getenv("GOOGLE_GEMINI_API_KEY"),
-        )
-        model_engine = os.getenv("GOOGLE_GEMINI_MODEL", "gemini-2.0-flash")
-
-        if not client.api_key:
-            raise LLMConfigurationError(
-                "GEMINI environment variables GOOGLE_GEMINI_API_KEY not set for google-gemini provider",
-            )
-
-    elif provider == "anthropic":
-        client = OpenAI(
-            base_url=os.getenv("ANTHROPIC_BASE_URL", "https://api.anthropic.com/v1"),
-            api_key=os.getenv("ANTHROPIC_API_KEY"),
-        )
-        model_engine = os.getenv("ANTHROPIC_MODEL", "claude-3-5-haiku-latest")
-
-        if not client.api_key:
-            raise LLMConfigurationError(
-                "Anthropic environment variables ANTHROPIC_API_KEY not set for anthropic provider",
-            )
-
-    else:
-        raise LLMConfigurationError(
-            f"Invalid LLM provider '{provider}'. Valid options: openai, azure-openai, azure-openai-ad, google-gemini, anthropic, lm-studio, ollama.",
-        )
-
-    missing_vars = [var for var in _LLM_PROVIDER_REQUIRED_ENV_VARS[provider] if not os.getenv(var)]
-    if missing_vars:
-        raise LLMConfigurationError(
-            f"ERROR: Missing environment variables for {provider}: {', '.join(missing_vars)}. Please refer to the documentation to set them correctly.",
-        )
+    client, model_engine = _build_llm_client_for_provider(provider)
+    _raise_missing_provider_env_vars(provider)
 
     return client, model_engine
 
@@ -1915,78 +1971,146 @@ def suggest_documentation_improvements(
     if upstream_docs is None:
         upstream_docs = []
 
-    # Calculate base confidence
-    confidence = 0.5
-
-    # Boost confidence if we have style information
-    if style_profile or style_examples:
-        confidence += 0.2
-
-    # Boost confidence if we have upstream documentation
-    if upstream_docs and any(d.strip() for d in upstream_docs):
-        confidence += 0.15
-
-    # Boost confidence if we have SQL context (for tables)
-    if target == "table" and sql_content:
-        confidence += 0.1
-
-    # Adjust confidence based on current state
     has_current = bool(current_description and current_description.strip())
-
-    # Generate the suggestion
-    if target == "column":
-        if not column_name:
-            raise ValueError("column_name is required for column targets")
-
-        suggestion_text = generate_style_aware_column_doc(
-            column_name=column_name,
-            existing_context=existing_context,
-            table_name=table_name,
-            upstream_docs=upstream_docs,
-            temperature=temperature,
-            style_profile=style_profile,
-            style_examples=style_examples,
-            current_description=current_description,
-        )
-
-        # Higher confidence for improvements vs new docs
-        if has_current:
-            confidence += 0.05
-            reason = f"Improving existing description for column '{column_name}'"
-        else:
-            reason = f"Generating new description for undocumented column '{column_name}'"
-
-    elif target == "table":
-        if not table_name:
-            raise ValueError("table_name is required for table targets")
-        if not sql_content:
-            raise ValueError("sql_content is required for table targets")
-
-        suggestion_text = generate_style_aware_table_doc(
-            sql_content=sql_content,
-            table_name=table_name,
-            upstream_docs=upstream_docs,
-            temperature=temperature,
-            style_profile=style_profile,
-            style_examples=style_examples,
-            current_description=current_description,
-        )
-
-        if has_current:
-            confidence += 0.05
-            reason = f"Improving existing description for table '{table_name}'"
-        else:
-            reason = f"Generating new description for undocumented table '{table_name}'"
-
-    else:
-        raise ValueError(f"Invalid target: {target}. Must be 'column' or 'table'")
-
-    # Clamp confidence to [0, 1]
-    confidence = max(0.0, min(1.0, confidence))
+    suggestion_text, reason = _style_aware_suggestion_text_and_reason(
+        target=target,
+        current_description=current_description,
+        column_name=column_name,
+        table_name=table_name,
+        sql_content=sql_content,
+        existing_context=existing_context,
+        upstream_docs=upstream_docs,
+        style_profile=style_profile,
+        style_examples=style_examples,
+        temperature=temperature,
+        has_current=has_current,
+    )
 
     return DocumentationSuggestion(
         text=suggestion_text,
-        confidence=confidence,
+        confidence=_documentation_suggestion_confidence(
+            target, sql_content, upstream_docs, style_profile, style_examples, has_current
+        ),
         reason=reason,
         source="llm-style-aware",
     )
+
+
+def _documentation_suggestion_confidence(
+    target: str,
+    sql_content: str | None,
+    upstream_docs: list[str],
+    style_profile: ProjectStyleProfile | None,
+    style_examples: list[str] | None,
+    has_current: bool,
+) -> float:
+    confidence = 0.5
+    if style_profile or style_examples:
+        confidence += 0.2
+    if upstream_docs and any(d.strip() for d in upstream_docs):
+        confidence += 0.15
+    if target == "table" and sql_content:
+        confidence += 0.1
+    if has_current:
+        confidence += 0.05
+    return max(0.0, min(1.0, confidence))
+
+
+def _style_aware_suggestion_text_and_reason(
+    *,
+    target: str,
+    current_description: str | None,
+    column_name: str | None,
+    table_name: str | None,
+    sql_content: str | None,
+    existing_context: str | None,
+    upstream_docs: list[str],
+    style_profile: ProjectStyleProfile | None,
+    style_examples: list[str] | None,
+    temperature: float,
+    has_current: bool,
+) -> tuple[str, str]:
+    if target == "column":
+        return _column_suggestion_text_and_reason(
+            current_description=current_description,
+            column_name=column_name,
+            table_name=table_name,
+            existing_context=existing_context,
+            upstream_docs=upstream_docs,
+            style_profile=style_profile,
+            style_examples=style_examples,
+            temperature=temperature,
+            has_current=has_current,
+        )
+    if target == "table":
+        return _table_suggestion_text_and_reason(
+            current_description=current_description,
+            table_name=table_name,
+            sql_content=sql_content,
+            upstream_docs=upstream_docs,
+            style_profile=style_profile,
+            style_examples=style_examples,
+            temperature=temperature,
+            has_current=has_current,
+        )
+    raise ValueError(f"Invalid target: {target}. Must be 'column' or 'table'")
+
+
+def _column_suggestion_text_and_reason(
+    *,
+    current_description: str | None,
+    column_name: str | None,
+    table_name: str | None,
+    existing_context: str | None,
+    upstream_docs: list[str],
+    style_profile: ProjectStyleProfile | None,
+    style_examples: list[str] | None,
+    temperature: float,
+    has_current: bool,
+) -> tuple[str, str]:
+    if not column_name:
+        raise ValueError("column_name is required for column targets")
+
+    suggestion_text = generate_style_aware_column_doc(
+        column_name=column_name,
+        existing_context=existing_context,
+        table_name=table_name,
+        upstream_docs=upstream_docs,
+        temperature=temperature,
+        style_profile=style_profile,
+        style_examples=style_examples,
+        current_description=current_description,
+    )
+    if has_current:
+        return suggestion_text, f"Improving existing description for column '{column_name}'"
+    return suggestion_text, f"Generating new description for undocumented column '{column_name}'"
+
+
+def _table_suggestion_text_and_reason(
+    *,
+    current_description: str | None,
+    table_name: str | None,
+    sql_content: str | None,
+    upstream_docs: list[str],
+    style_profile: ProjectStyleProfile | None,
+    style_examples: list[str] | None,
+    temperature: float,
+    has_current: bool,
+) -> tuple[str, str]:
+    if not table_name:
+        raise ValueError("table_name is required for table targets")
+    if not sql_content:
+        raise ValueError("sql_content is required for table targets")
+
+    suggestion_text = generate_style_aware_table_doc(
+        sql_content=sql_content,
+        table_name=table_name,
+        upstream_docs=upstream_docs,
+        temperature=temperature,
+        style_profile=style_profile,
+        style_examples=style_examples,
+        current_description=current_description,
+    )
+    if has_current:
+        return suggestion_text, f"Improving existing description for table '{table_name}'"
+    return suggestion_text, f"Generating new description for undocumented table '{table_name}'"
