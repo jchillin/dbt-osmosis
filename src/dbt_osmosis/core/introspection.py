@@ -203,6 +203,50 @@ def _get_options_value(
     return _MISSING
 
 
+def _setting_key_variants(setting_name: str) -> tuple[str, str]:
+    """Return kebab-case and snake_case variants for a setting name."""
+    return setting_name.replace("_", "-"), setting_name.replace("-", "_")
+
+
+def _get_setting_from_mapping(
+    source: t.Any,
+    setting_name: str,
+    *,
+    direct_keys: bool,
+) -> t.Any:
+    """Read a setting from a mapping while preserving explicit falsey values."""
+    if not isinstance(source, t.Mapping):
+        return _MISSING
+
+    kebab_key, snake_key = _setting_key_variants(setting_name)
+    for prefixed_name in (f"dbt-osmosis-{kebab_key}", f"dbt_osmosis_{snake_key}"):
+        if prefixed_name in source:
+            return source[prefixed_name]
+
+    if direct_keys:
+        if kebab_key in source:
+            return source[kebab_key]
+        if snake_key in source:
+            return source[snake_key]
+
+    for options_name in ("dbt-osmosis-options", "dbt_osmosis_options"):
+        value = _get_options_value(source.get(options_name, {}), kebab_key, snake_key)
+        if value is not _MISSING:
+            return value
+    return _MISSING
+
+
+def _setting_value_or_none(
+    source: t.Any,
+    setting_name: str,
+    *,
+    direct_keys: bool,
+) -> t.Any | None:
+    """Return a setting value for debug chains, or None when the source is missing."""
+    value = _get_setting_from_mapping(source, setting_name, direct_keys=direct_keys)
+    return None if value is _MISSING else value
+
+
 def _same_setting_value(left: t.Any, right: t.Any) -> bool:
     """Compare settings values with Click tuple defaults matching dataclass lists."""
     if isinstance(left, (list, tuple)) and isinstance(right, (list, tuple)):
@@ -232,6 +276,32 @@ def _get_explicit_context_setting_value(context: t.Any, setting_name: str) -> t.
     if not _same_setting_value(current_value, default_value):
         return current_value
     return _MISSING
+
+
+def _project_vars_dict(context: t.Any) -> dict[str, t.Any] | None:
+    """Return project vars as a dictionary when available."""
+    if not hasattr(context, "project"):
+        return None
+    if not hasattr(context.project, "runtime_cfg"):
+        return None
+    if not hasattr(context.project.runtime_cfg, "vars"):
+        return None
+
+    vars_dict = context.project.runtime_cfg.vars
+    if hasattr(vars_dict, "to_dict"):
+        vars_dict = vars_dict.to_dict()
+    if isinstance(vars_dict, dict):
+        return vars_dict
+    return None
+
+
+def _project_vars_sources(vars_dict: dict[str, t.Any]) -> tuple[t.Any, t.Any, t.Any]:
+    """Return project vars lookup sections in precedence order."""
+    return (
+        vars_dict.get("dbt-osmosis", {}),
+        vars_dict.get("dbt_osmosis", {}),
+        vars_dict,
+    )
 
 
 def _merge_column_meta(
@@ -513,60 +583,14 @@ class ProjectVarsSource(ConfigurationSource):
             The configuration value if found, None otherwise.
 
         """
-        # Safely access runtime_cfg.vars
-        if not hasattr(self._context, "project"):
-            return None
-        if not hasattr(self._context.project, "runtime_cfg"):
-            return None
-        if not hasattr(self._context.project.runtime_cfg, "vars"):
+        vars_dict = _project_vars_dict(self._context)
+        if vars_dict is None:
             return None
 
-        # Get vars as dictionary
-        vars_dict = self._context.project.runtime_cfg.vars
-        if hasattr(vars_dict, "to_dict"):
-            vars_dict = vars_dict.to_dict()
-        if not isinstance(vars_dict, dict):
-            return None
-
-        # Normalize key
-        kebab_key = key.replace("_", "-")
-        snake_key = key.replace("-", "_")
-
-        def mapping_value(source: t.Any) -> t.Any:
-            if not isinstance(source, t.Mapping):
-                return _MISSING
-
-            for prefixed_name in (f"dbt-osmosis-{kebab_key}", f"dbt_osmosis_{snake_key}"):
-                if prefixed_name in source:
-                    return source[prefixed_name]
-
-            if kebab_key in source:
-                return source[kebab_key]
-            if snake_key in source:
-                return source[snake_key]
-
-            for options_name in ("dbt-osmosis-options", "dbt_osmosis_options"):
-                value = _get_options_value(source.get(options_name, {}), kebab_key, snake_key)
-                if value is not _MISSING:
-                    return value
-
-            return _MISSING
-
-        # Check dbt-osmosis top-level key
-        dbt_osmosis_vars = vars_dict.get("dbt-osmosis", {})
-        value = mapping_value(dbt_osmosis_vars)
-        if value is not _MISSING:
-            return value
-
-        # Check dbt_osmosis top-level key (snake_case variant)
-        dbt_osmosis_vars_snake = vars_dict.get("dbt_osmosis", {})
-        value = mapping_value(dbt_osmosis_vars_snake)
-        if value is not _MISSING:
-            return value
-
-        value = mapping_value(vars_dict)
-        if value is not _MISSING:
-            return value
+        for source in _project_vars_sources(vars_dict):
+            value = _get_setting_from_mapping(source, key, direct_keys=True)
+            if value is not _MISSING:
+                return value
 
         return None
 
@@ -738,6 +762,198 @@ class SupplementaryFileSource(ConfigurationSource):
         return None
 
 
+def _configuration_source_value(source: ConfigurationSource, setting_name: str) -> t.Any:
+    """Read a ConfigurationSource using _MISSING for absent values."""
+    value = source.get(setting_name)
+    return _MISSING if value is None else value
+
+
+def _node_dict_setting_sources(
+    node: ResultNode,
+    column_name: str | None,
+) -> list[tuple[str, t.Any, bool]]:
+    """Return mapping-backed node setting sources in precedence order."""
+    sources: list[tuple[str, t.Any, bool]] = []
+    if column_name and (column := node.columns.get(column_name)):
+        sources.append(("column_meta", _get_effective_column_meta(column), True))
+    sources.extend([
+        ("node_meta", getattr(node, "meta", {}), True),
+        ("config_extra", getattr(getattr(node, "config", None), "extra", {}), False),
+    ])
+    return sources
+
+
+def _node_configuration_sources(node: ResultNode) -> list[tuple[str, ConfigurationSource]]:
+    """Return object-backed dbt 1.10+ setting sources in precedence order."""
+    sources: list[tuple[str, ConfigurationSource]] = []
+    if hasattr(node, "config") and hasattr(node.config, "meta"):
+        sources.append(("config.meta (dbt 1.10+)", ConfigMetaSource(node)))
+    if hasattr(node, "unrendered_config"):
+        sources.append(("unrendered_config (dbt 1.10+)", UnrenderedConfigSource(node)))
+    return sources
+
+
+def _log_resolved_setting(setting_name: str, source_name: str) -> None:
+    logger.debug(":gear: Resolved setting '%s' from %s", setting_name, source_name)
+
+
+def _resolve_node_setting(
+    setting_name: str,
+    node: ResultNode,
+    column_name: str | None,
+) -> t.Any:
+    """Resolve a setting from node-backed sources, or _MISSING."""
+    for source_name, source, direct_keys in _node_dict_setting_sources(node, column_name):
+        value = _get_setting_from_mapping(source, setting_name, direct_keys=direct_keys)
+        if value is not _MISSING:
+            _log_resolved_setting(setting_name, source_name)
+            return value
+
+    for source_name, source in _node_configuration_sources(node):
+        value = _configuration_source_value(source, setting_name)
+        if value is not _MISSING:
+            _log_resolved_setting(setting_name, source_name)
+            return value
+    return _MISSING
+
+
+def _explicit_context_source_value(
+    active_context: t.Any,
+    setting_name: str,
+    fallback: t.Any,
+) -> t.Any:
+    """Return explicit runtime settings when they match the existing fallback rule."""
+    current_value = _get_explicit_context_setting_value(active_context, setting_name)
+    if current_value is _MISSING:
+        return _MISSING
+    if not _same_setting_value(current_value, fallback):
+        return _MISSING
+    return current_value
+
+
+def _context_configuration_sources(active_context: t.Any) -> tuple[ConfigurationSource, ...]:
+    """Return context-backed project setting sources in precedence order."""
+    return (
+        SupplementaryFileSource(active_context),
+        ProjectVarsSource(active_context),
+    )
+
+
+def _resolve_context_setting(
+    setting_name: str,
+    active_context: t.Any | None,
+    fallback: t.Any,
+) -> t.Any:
+    """Resolve a setting from explicit context, supplementary file, or project vars."""
+    explicit_value = _explicit_context_source_value(active_context, setting_name, fallback)
+    if explicit_value is not _MISSING:
+        _log_resolved_setting(setting_name, "explicit context settings")
+        return explicit_value
+
+    if active_context is None:
+        return _MISSING
+
+    for context_source in _context_configuration_sources(active_context):
+        value = _configuration_source_value(context_source, setting_name)
+        if value is not _MISSING:
+            _log_resolved_setting(setting_name, context_source.name.value)
+            return value
+    return _MISSING
+
+
+def _node_precedence_entries(
+    setting_name: str,
+    node: ResultNode,
+    column_name: str | None,
+) -> list[tuple[ConfigSourceName, t.Any | None]]:
+    """Return node-backed debug precedence entries."""
+    entries: list[tuple[ConfigSourceName, t.Any | None]] = []
+    if column_name and (column := node.columns.get(column_name)):
+        entries.append((
+            ConfigSourceName.COLUMN_META,
+            _setting_value_or_none(
+                _get_effective_column_meta(column),
+                setting_name,
+                direct_keys=True,
+            ),
+        ))
+
+    entries.extend([
+        (
+            ConfigSourceName.NODE_META,
+            _setting_value_or_none(getattr(node, "meta", {}), setting_name, direct_keys=True),
+        ),
+        (
+            ConfigSourceName.CONFIG_EXTRA,
+            _setting_value_or_none(
+                getattr(getattr(node, "config", None), "extra", {}),
+                setting_name,
+                direct_keys=False,
+            ),
+        ),
+        (ConfigSourceName.CONFIG_META, _config_meta_precedence_value(setting_name, node)),
+        (
+            ConfigSourceName.UNRENDERED_CONFIG,
+            _unrendered_config_precedence_value(setting_name, node),
+        ),
+    ])
+    return entries
+
+
+def _config_meta_precedence_value(setting_name: str, node: ResultNode) -> t.Any | None:
+    if hasattr(node, "config") and hasattr(node.config, "meta"):
+        return ConfigMetaSource(node).get(setting_name)
+    return None
+
+
+def _unrendered_config_precedence_value(setting_name: str, node: ResultNode) -> t.Any | None:
+    if hasattr(node, "unrendered_config"):
+        return UnrenderedConfigSource(node).get(setting_name)
+    return None
+
+
+def _context_precedence_entries(
+    setting_name: str,
+    active_context: t.Any,
+) -> list[tuple[ConfigSourceName, t.Any | None]]:
+    """Return context-backed debug precedence entries."""
+    context_settings_value = _get_explicit_context_setting_value(active_context, setting_name)
+    if context_settings_value is _MISSING:
+        context_settings_value = None
+    return [
+        (ConfigSourceName.CONTEXT_SETTINGS, context_settings_value),
+        (
+            ConfigSourceName.SUPPLEMENTARY_FILE,
+            SupplementaryFileSource(active_context).get(setting_name),
+        ),
+        (ConfigSourceName.PROJECT_VARS, ProjectVarsSource(active_context).get(setting_name)),
+    ]
+
+
+def _yaml_path_template_from_mapping(source: t.Any) -> str | None:
+    """Return a dbt-osmosis path template from a mapping-like source."""
+    if not isinstance(source, t.Mapping):
+        return None
+    for key in ("dbt-osmosis", "dbt_osmosis"):
+        if key in source:
+            return t.cast("str | None", source[key])
+    return None
+
+
+def _yaml_path_template_sources(node: ResultNode) -> list[tuple[str, t.Any]]:
+    """Return YAML path template sources in precedence order."""
+    sources: list[tuple[str, t.Any]] = []
+    if hasattr(node, "config") and hasattr(node.config, "extra"):
+        sources.append(("config.extra", node.config.extra))
+    if hasattr(node, "config") and hasattr(node.config, "meta"):
+        sources.append(("config.meta", getattr(node.config, "meta", None)))
+    if hasattr(node, "meta"):
+        sources.append(("node.meta", node.meta))
+    if hasattr(node, "unrendered_config"):
+        sources.append(("unrendered_config", node.unrendered_config))
+    return sources
+
+
 # =============================================================================
 # Existing Settings Resolver (to be extended)
 # =============================================================================
@@ -809,115 +1025,14 @@ class SettingsResolver:
         """
         active_context = context if context is not None else self.context
 
-        def dict_value(source: t.Any, *, direct_keys: bool) -> t.Any:
-            if not isinstance(source, t.Mapping):
-                return _MISSING
-
-            kebab_name = setting_name.replace("_", "-")
-            snake_name = setting_name.replace("-", "_")
-
-            for prefixed_name in (f"dbt-osmosis-{kebab_name}", f"dbt_osmosis_{snake_name}"):
-                if prefixed_name in source:
-                    return source[prefixed_name]
-
-            if direct_keys:
-                if kebab_name in source:
-                    return source[kebab_name]
-                if snake_name in source:
-                    return source[snake_name]
-
-            options_kebab = source.get("dbt-osmosis-options", {})
-            options_snake = source.get("dbt_osmosis_options", {})
-            value = _get_options_value(options_kebab, kebab_name, snake_name)
-            if value is not _MISSING:
-                return value
-            value = _get_options_value(options_snake, kebab_name, snake_name)
-            if value is not _MISSING:
-                return value
-            return _MISSING
-
-        def source_value(source: ConfigurationSource) -> t.Any:
-            value = source.get(setting_name)
-            if value is None:
-                return _MISSING
-            return value
-
-        def explicit_context_setting_value() -> t.Any:
-            current_value = _get_explicit_context_setting_value(active_context, setting_name)
-            if current_value is _MISSING:
-                return _MISSING
-            if not _same_setting_value(current_value, fallback):
-                return _MISSING
-            return current_value
-
         if node is not None:
-            node_sources: list[tuple[str, t.Any, bool]] = []
+            node_value = _resolve_node_setting(setting_name, node, column_name)
+            if node_value is not _MISSING:
+                return node_value
 
-            # Column-level sources (if column specified) - HIGHEST precedence
-            if column_name and (column := node.columns.get(column_name)):
-                column_meta = _get_effective_column_meta(column)
-                node_sources.append(("column_meta", column_meta, True))
-
-            node_sources.extend([
-                ("node_meta", getattr(node, "meta", {}), True),
-                ("config_extra", getattr(getattr(node, "config", None), "extra", {}), False),
-            ])
-
-            # Check each source for the setting (in order - highest precedence first)
-            for source_name, source, direct_keys in node_sources:
-                value = dict_value(source, direct_keys=direct_keys)
-                if value is not _MISSING:
-                    logger.debug(
-                        ":gear: Resolved setting '%s' from %s",
-                        setting_name,
-                        source_name,
-                    )
-                    return value
-
-            # Check dbt 1.10+ sources AFTER existing sources (lower precedence)
-            # Check config.meta (dbt 1.10+)
-            if hasattr(node, "config") and hasattr(node.config, "meta"):
-                config_meta_source = ConfigMetaSource(node)
-                value = source_value(config_meta_source)
-                if value is not _MISSING:
-                    logger.debug(
-                        ":gear: Resolved setting '%s' from config.meta (dbt 1.10+)",
-                        setting_name,
-                    )
-                    return value
-
-            # Check unrendered_config (dbt 1.10+)
-            if hasattr(node, "unrendered_config"):
-                unrendered_source = UnrenderedConfigSource(node)
-                value = source_value(unrendered_source)
-                if value is not _MISSING:
-                    logger.debug(
-                        ":gear: Resolved setting '%s' from unrendered_config (dbt 1.10+)",
-                        setting_name,
-                    )
-                    return value
-
-        explicit_context_value = explicit_context_setting_value()
-        if explicit_context_value is not _MISSING:
-            logger.debug(
-                ":gear: Resolved setting '%s' from explicit context settings",
-                setting_name,
-            )
-            return explicit_context_value
-
-        if active_context is not None:
-            for context_source in (
-                SupplementaryFileSource(active_context),
-                ProjectVarsSource(active_context),
-            ):
-                value = source_value(context_source)
-                if value is not _MISSING:
-                    logger.debug(
-                        ":gear: Resolved setting '%s' from %s",
-                        setting_name,
-                        context_source.name.value,
-                    )
-                    return value
+        context_value = _resolve_context_setting(setting_name, active_context, fallback)
+        if context_value is not _MISSING:
+            return context_value
 
         logger.debug(
             ":gear: Setting '%s' not found, using fallback: %s",
@@ -979,76 +1094,13 @@ class SettingsResolver:
 
         """
         active_context = context if context is not None else self.context
-        chain = []
-
-        kebab_name = setting_name.replace("_", "-")
-        snake_name = setting_name.replace("-", "_")
-
-        # Helper to extract value from a dict source
-        def extract_value(source: t.Any, *, direct_keys: bool) -> t.Any | None:
-            if not isinstance(source, t.Mapping):
-                return None
-            # Check prefixed variants
-            for prefixed_name in (f"dbt-osmosis-{kebab_name}", f"dbt_osmosis_{snake_name}"):
-                if prefixed_name in source:
-                    return source[prefixed_name]
-            # Check direct variants
-            if direct_keys:
-                if kebab_name in source:
-                    return source[kebab_name]
-                if snake_name in source:
-                    return source[snake_name]
-            for options_name in ("dbt-osmosis-options", "dbt_osmosis_options"):
-                value = _get_options_value(source.get(options_name, {}), kebab_name, snake_name)
-                if value is not _MISSING:
-                    return value
-            return None
+        chain: list[tuple[ConfigSourceName, t.Any | None]] = []
 
         if node is not None:
-            # Column-level sources
-            if column_name and (column := node.columns.get(column_name)):
-                value = extract_value(_get_effective_column_meta(column), direct_keys=True)
-                chain.append((ConfigSourceName.COLUMN_META, value))
-
-            # Node meta sources
-            value = extract_value(node.meta, direct_keys=True)
-            chain.append((ConfigSourceName.NODE_META, value))
-
-            # Node config.extra
-            value = extract_value(node.config.extra, direct_keys=False)
-            chain.append((ConfigSourceName.CONFIG_EXTRA, value))
-
-            # Config.meta (dbt 1.10+)
-            if hasattr(node, "config") and hasattr(node.config, "meta"):
-                config_meta_source = ConfigMetaSource(node)
-                value = config_meta_source.get(setting_name)
-                chain.append((ConfigSourceName.CONFIG_META, value))
-            else:
-                chain.append((ConfigSourceName.CONFIG_META, None))
-
-            # Unrendered config (dbt 1.10+)
-            if hasattr(node, "unrendered_config"):
-                unrendered_source = UnrenderedConfigSource(node)
-                value = unrendered_source.get(setting_name)
-                chain.append((ConfigSourceName.UNRENDERED_CONFIG, value))
-            else:
-                chain.append((ConfigSourceName.UNRENDERED_CONFIG, None))
+            chain.extend(_node_precedence_entries(setting_name, node, column_name))
 
         if active_context is not None:
-            context_settings_value = _get_explicit_context_setting_value(
-                active_context,
-                setting_name,
-            )
-            if context_settings_value is _MISSING:
-                context_settings_value = None
-            chain.append((ConfigSourceName.CONTEXT_SETTINGS, context_settings_value))
-
-            supplementary_source = SupplementaryFileSource(active_context)
-            supplementary_value = supplementary_source.get(setting_name)
-            chain.append((ConfigSourceName.SUPPLEMENTARY_FILE, supplementary_value))
-            project_vars_source = ProjectVarsSource(active_context)
-            project_vars_value = project_vars_source.get(setting_name)
-            chain.append((ConfigSourceName.PROJECT_VARS, project_vars_value))
+            chain.extend(_context_precedence_entries(setting_name, active_context))
 
         chain.append((ConfigSourceName.FALLBACK, None))
 
@@ -1080,61 +1132,11 @@ class SettingsResolver:
         if node is None:
             return None
 
-        # Keys to check (both kebab and snake variants)
-        keys = ("dbt-osmosis", "dbt_osmosis")
-
-        # Helper to check a dict for the path template
-        def check_dict(source: dict[str, t.Any]) -> str | None:
-            for key in keys:
-                if key in source:
-                    return source[key]
-            return None
-
-        # Check config.extra first (highest priority)
-        if hasattr(node, "config") and hasattr(node.config, "extra"):
-            result = check_dict(node.config.extra)
+        for source_name, source in _yaml_path_template_sources(node):
+            result = _yaml_path_template_from_mapping(source)
             if result:
-                logger.debug(
-                    ":gear: Found YAML path template in config.extra: %s",
-                    result,
-                )
+                logger.debug(":gear: Found YAML path template in %s: %s", source_name, result)
                 return result
-
-        # Check config.meta (dbt 1.10+)
-        if hasattr(node, "config") and hasattr(node.config, "meta"):
-            config_meta = getattr(node.config, "meta", None)
-            if isinstance(config_meta, dict):
-                result = check_dict(config_meta)
-                if result:
-                    logger.debug(
-                        ":gear: Found YAML path template in config.meta: %s",
-                        result,
-                    )
-                    return result
-
-        # Check node.meta (for YAML-level meta definitions)
-        if hasattr(node, "meta"):
-            node_meta = node.meta
-            if isinstance(node_meta, dict):
-                result = check_dict(node_meta)
-                if result:
-                    logger.debug(
-                        ":gear: Found YAML path template in node.meta: %s",
-                        result,
-                    )
-                    return result
-
-        # Check unrendered_config (dbt 1.10+)
-        if hasattr(node, "unrendered_config"):
-            unrendered = node.unrendered_config
-            if isinstance(unrendered, dict):
-                result = check_dict(unrendered)
-                if result:
-                    logger.debug(
-                        ":gear: Found YAML path template in unrendered_config: %s",
-                        result,
-                    )
-                    return result
 
         logger.debug(":gear: No YAML path template found in node config")
         return None
@@ -1289,6 +1291,178 @@ def resolve_setting(
     )
 
 
+def _relation_for_column_collection(
+    context: t.Any,
+    relation: BaseRelation | ResultNode,
+) -> tuple[BaseRelation, ResultNode | None]:
+    """Return a dbt relation plus the source node when one was provided."""
+    if isinstance(relation, BaseRelation):
+        return relation, None
+
+    return (
+        context.project.adapter.Relation.create_from(
+            context.project.adapter.config,  # pyright: ignore[reportUnknownArgumentType]
+            relation,  # pyright: ignore[reportArgumentType]
+        ),
+        relation,
+    )
+
+
+def _rendered_relation_name(relation: BaseRelation) -> str:
+    """Render a relation if possible, otherwise stringify it."""
+    if not relation:
+        return ""
+    renderer = getattr(t.cast(t.Any, relation), "render", None)
+    return t.cast("str", renderer()) if callable(renderer) else str(relation)
+
+
+def _iter_flattened_columns(column: BaseColumn | ColumnMetadata) -> t.Iterable[t.Any]:
+    """Yield a column plus any adapter-provided flattened child columns."""
+    yield column
+    flattener = getattr(t.cast(t.Any, column), "flatten", None)
+    if callable(flattener):
+        yield from t.cast(t.Iterable[t.Any], flattener())
+
+
+def _column_matches_ignore_pattern(context: t.Any, column_name: str) -> bool:
+    """Return True when a column should be skipped by configured patterns."""
+    return any(re.match(pattern, column_name) for pattern in context.ignore_patterns)
+
+
+def _column_comment(column: BaseColumn) -> str | None:
+    """Return adapter-specific column comments."""
+    return getattr(column, "description", None) or getattr(column, "comment", None)
+
+
+def _column_metadata_for_output(
+    context: t.Any,
+    result_node: ResultNode | None,
+    column: BaseColumn | ColumnMetadata,
+    normalized_name: str,
+    index: int,
+) -> ColumnMetadata:
+    """Return manifest-compatible metadata for a warehouse or catalog column."""
+    if isinstance(column, ColumnMetadata):
+        return column
+
+    return ColumnMetadata(
+        name=normalized_name,
+        type=_maybe_use_precise_dtype(column, context.settings, result_node, context=context),
+        index=index,
+        comment=_column_comment(column),
+    )
+
+
+def _add_processed_columns(
+    context: t.Any,
+    result_node: ResultNode | None,
+    normalized_columns: OrderedDict[str, ColumnMetadata],
+    raw_column: BaseColumn | ColumnMetadata,
+    index: int,
+) -> int:
+    """Normalize and add one raw column plus flattened children."""
+    credentials_type = context.project.runtime_cfg.credentials.type
+    for column in _iter_flattened_columns(raw_column):
+        if _column_matches_ignore_pattern(context, column.name):
+            logger.debug(
+                ":no_entry_sign: Skipping column => %s due to skip pattern match.",
+                column.name,
+            )
+            continue
+        normalized_name = normalize_column_name(column.name, credentials_type)
+        normalized_columns[normalized_name] = _column_metadata_for_output(
+            context,
+            result_node,
+            column,
+            normalized_name,
+            index,
+        )
+        index += 1
+    return index
+
+
+def _processed_columns(
+    context: t.Any,
+    result_node: ResultNode | None,
+    columns: t.Iterable[BaseColumn | ColumnMetadata],
+) -> OrderedDict[str, ColumnMetadata]:
+    """Convert raw warehouse or catalog columns into normalized metadata."""
+    normalized_columns: OrderedDict[str, ColumnMetadata] = OrderedDict()
+    index = 0
+    for column in columns:
+        index = _add_processed_columns(context, result_node, normalized_columns, column, index)
+    return normalized_columns
+
+
+def _catalog_entry_matches(matcher: t.Any, entry: t.Any) -> bool:
+    """Return True when a catalog entry matches the active relation."""
+    if not callable(matcher):
+        return False
+    try:
+        return bool(matcher(*entry.key()))
+    except ApproximateMatchError:
+        # For Snowflake and other case-insensitive databases, an approximate
+        # match (case difference) IS the same relation, so treat as match.
+        return True
+
+
+def _catalog_columns_for_relation(
+    context: t.Any,
+    relation: BaseRelation,
+    rendered_relation: str,
+) -> tuple[ColumnMetadata, ...] | None:
+    """Return catalog columns for a relation when a matching catalog entry exists."""
+    catalog = context.read_catalog()
+    if not catalog:
+        return None
+
+    logger.debug(":blue_book: Catalog found => Checking for ref => %s", rendered_relation)
+    matcher = getattr(t.cast(t.Any, relation), "matches", None)
+    catalog_entry = _find_first(
+        chain(catalog.nodes.values(), catalog.sources.values()),
+        lambda entry: _catalog_entry_matches(matcher, entry),
+    )
+    if not catalog_entry:
+        return None
+
+    logger.info(
+        ":books: Found catalog entry for => %s. Using it to process columns.",
+        rendered_relation,
+    )
+    return tuple(catalog_entry.columns.values())
+
+
+def _cached_warehouse_columns(
+    context: t.Any,
+    relation: BaseRelation,
+    rendered_relation: str,
+) -> tuple[BaseColumn, ...]:
+    """Return cached warehouse columns or introspect and cache them."""
+    cache_key = _build_column_cache_key(context, rendered_relation)
+    with _COLUMN_LIST_CACHE_LOCK:
+        cached_columns = _COLUMN_LIST_CACHE.get(cache_key)
+
+    if cached_columns is not None:
+        logger.debug(":blue_book: Column list cache HIT => %s", rendered_relation)
+        return cached_columns
+
+    try:
+        logger.info(":mag: Introspecting columns in warehouse for => %s", rendered_relation)
+        warehouse_columns = tuple(
+            t.cast(
+                "t.Iterable[BaseColumn]",
+                context.project.adapter.get_columns_in_relation(relation),
+            ),
+        )
+    except Exception as ex:  # noqa: BLE001
+        logger.warning(":warning: Could not introspect columns for %s: %s", rendered_relation, ex)
+        return ()
+
+    with _COLUMN_LIST_CACHE_LOCK:
+        _COLUMN_LIST_CACHE[cache_key] = warehouse_columns
+    return warehouse_columns
+
+
 def get_columns(
     context: t.Any,
     relation: BaseRelation | ResultNode | None,
@@ -1303,137 +1477,92 @@ def get_columns(
         OrderedDict mapping normalized column names to ColumnMetadata.
 
     """
-    normalized_columns: OrderedDict[str, ColumnMetadata] = OrderedDict()
-
     if relation is None:
         logger.debug(":blue_book: Relation is empty, skipping column collection.")
-        return normalized_columns
+        return OrderedDict()
 
-    result_node: ResultNode | None = None
-    if not isinstance(relation, BaseRelation):
-        # NOTE: Technically, we should use `isinstance(relation, ResultNode)` to verify it's a ResultNode,
-        #       but since ResultNode is defined as a Union[...], Python 3.9 raises
-        #       > TypeError: Subscripted generics cannot be used with class and instance checks
-        #       To avoid that, we're skipping the isinstance check.
-        result_node = relation  # may be a ResultNode
-        relation = context.project.adapter.Relation.create_from(
-            context.project.adapter.config,  # pyright: ignore[reportUnknownArgumentType]
-            relation,  # pyright: ignore[reportArgumentType]
-        )
-
-    relation_any = t.cast(t.Any, relation)
-    if relation:
-        renderer = getattr(relation_any, "render", None)
-        rendered_relation = t.cast("str", renderer()) if callable(renderer) else str(relation)
-    else:
-        rendered_relation = ""
-
+    relation, result_node = _relation_for_column_collection(context, relation)
+    rendered_relation = _rendered_relation_name(relation)
     logger.info(":mag_right: Collecting columns for table => %s", rendered_relation)
-    index = 0
 
-    def process_column(c: BaseColumn | ColumnMetadata, /) -> None:
-        nonlocal index
-
-        columns = [c]
-        flattener = getattr(t.cast(t.Any, c), "flatten", None)
-        if callable(flattener):
-            columns.extend(t.cast(t.Iterable[t.Any], flattener()))
-
-        for column in columns:
-            if any(re.match(b, column.name) for b in context.ignore_patterns):
-                logger.debug(
-                    ":no_entry_sign: Skipping column => %s due to skip pattern match.",
-                    column.name,
-                )
-                continue
-            normalized = normalize_column_name(
-                column.name,
-                context.project.runtime_cfg.credentials.type,
-            )
-            if not isinstance(column, ColumnMetadata):
-                dtype = _maybe_use_precise_dtype(
-                    column,
-                    context.settings,
-                    result_node,
-                    context=context,
-                )
-                # BigQuery uses "description" attribute, other adapters use "comment"
-                col_comment = getattr(column, "description", None) or getattr(
-                    column,
-                    "comment",
-                    None,
-                )
-                column = ColumnMetadata(
-                    name=normalized,
-                    type=dtype,
-                    index=index,
-                    comment=col_comment,
-                )
-            normalized_columns[normalized] = column
-            index += 1
-
-    if catalog := context.read_catalog():
-        logger.debug(":blue_book: Catalog found => Checking for ref => %s", rendered_relation)
-        matcher = getattr(relation_any, "matches", None)
-
-        def matches_relation(entry: t.Any) -> bool:
-            if not callable(matcher):
-                return False
-            try:
-                return bool(matcher(*entry.key()))
-            except ApproximateMatchError:
-                # For Snowflake and other case-insensitive databases, an approximate
-                # match (case difference) IS the same relation, so treat as match
-                return True
-
-        catalog_entry = _find_first(
-            chain(catalog.nodes.values(), catalog.sources.values()),
-            matches_relation,
-        )
-        if catalog_entry:
-            logger.info(
-                ":books: Found catalog entry for => %s. Using it to process columns.",
-                rendered_relation,
-            )
-            for column in catalog_entry.columns.values():
-                process_column(column)
-            return normalized_columns
+    catalog_columns = _catalog_columns_for_relation(context, relation, rendered_relation)
+    if catalog_columns is not None:
+        return _processed_columns(context, result_node, catalog_columns)
 
     if context.project.config.disable_introspection:
         logger.warning(
             ":warning: Introspection is disabled, cannot introspect columns and no catalog entry.",
         )
-        return normalized_columns
+        return OrderedDict()
 
-    cache_key = _build_column_cache_key(context, rendered_relation)
-    with _COLUMN_LIST_CACHE_LOCK:
-        cached_columns = _COLUMN_LIST_CACHE.get(cache_key)
+    warehouse_columns = _cached_warehouse_columns(context, relation, rendered_relation)
+    return _processed_columns(context, result_node, warehouse_columns)
 
-    if cached_columns is not None:
-        logger.debug(":blue_book: Column list cache HIT => %s", rendered_relation)
-        for column in cached_columns:
-            process_column(column)
-        return normalized_columns
 
-    try:
-        logger.info(":mag: Introspecting columns in warehouse for => %s", rendered_relation)
-        warehouse_columns = tuple(
-            t.cast(
-                "t.Iterable[BaseColumn]",
-                context.project.adapter.get_columns_in_relation(relation),
-            ),
-        )
-    except Exception as ex:  # noqa: BLE001
-        logger.warning(":warning: Could not introspect columns for %s: %s", rendered_relation, ex)
-        return normalized_columns
+def _manifest_column_property(column: t.Any, property_key: str) -> t.Any | None:
+    """Return a column property from manifest metadata."""
+    if property_key == "description":
+        return getattr(column, "description", None)
+    if property_key == "data_type":
+        return getattr(column, "data_type", None)
+    if property_key == "tags":
+        return _get_effective_column_tags(column)
+    if property_key == "meta":
+        return _get_effective_column_meta(column)
+    if property_key == "name":
+        return getattr(column, "name", None)
+    return getattr(column, property_key, None)
 
-    with _COLUMN_LIST_CACHE_LOCK:
-        _COLUMN_LIST_CACHE[cache_key] = warehouse_columns
 
-    for column in warehouse_columns:
-        process_column(column)
+def _manifest_node_property(node: ResultNode, property_key: str) -> t.Any | None:
+    """Return a node property from manifest metadata."""
+    if property_key == "description":
+        return getattr(node, "description", None)
+    if property_key == "tags":
+        return getattr(node, "tags", None)
+    if property_key == "meta":
+        return getattr(node, "meta", None)
+    if property_key == "name":
+        return getattr(node, "name", None)
+    return getattr(node, property_key, None)
 
-    return normalized_columns
+
+def _node_log_id(node: ResultNode) -> str:
+    """Return a stable node identifier for property-access log messages."""
+    return t.cast("str", getattr(node, "unique_id", "unknown"))
+
+
+def _node_has_yaml_patch(node: ResultNode) -> bool:
+    """Return True when a node has a patch path suitable for YAML access."""
+    return hasattr(node, "patch_path") and node.patch_path is not None
+
+
+def _yaml_column_property(column: t.Mapping[str, t.Any], property_key: str) -> t.Any | None:
+    """Return a column property from raw YAML column content."""
+    if property_key == "tags":
+        config = column.get("config")
+        if "tags" not in column and not (isinstance(config, t.Mapping) and "tags" in config):
+            return None
+        return _get_effective_column_tags(column)
+    if property_key == "meta":
+        config = column.get("config")
+        if "meta" not in column and not (isinstance(config, t.Mapping) and "meta" in config):
+            return None
+        return _get_effective_column_meta(column)
+    return column.get(property_key)
+
+
+def _yaml_column_value(
+    yaml_content: t.Mapping[str, t.Any],
+    property_key: str,
+    column_name: str,
+) -> t.Any | None:
+    """Return a property for a named YAML column."""
+    columns = yaml_content.get("columns", [])
+    for column in columns:
+        if isinstance(column, t.Mapping) and column.get("name") == column_name:
+            return _yaml_column_property(column, property_key)
+    return None
 
 
 # =============================================================================
@@ -1490,36 +1619,13 @@ class PropertyAccessor:
             The property value from manifest, or None if not found
 
         """
-        # Handle column-level properties
         if column_name:
             column = node.columns.get(column_name)
             if column is None:
                 return None
-            # Map property keys to column attributes
-            if property_key == "description":
-                return getattr(column, "description", None)
-            if property_key == "data_type":
-                return getattr(column, "data_type", None)
-            if property_key == "tags":
-                return _get_effective_column_tags(column)
-            if property_key == "meta":
-                return _get_effective_column_meta(column)
-            if property_key == "name":
-                return getattr(column, "name", None)
-            # Try generic attribute access
-            return getattr(column, property_key, None)
+            return _manifest_column_property(column, property_key)
 
-        # Handle node-level properties
-        if property_key == "description":
-            return getattr(node, "description", None)
-        if property_key == "tags":
-            return getattr(node, "tags", None)
-        if property_key == "meta":
-            return getattr(node, "meta", None)
-        if property_key == "name":
-            return getattr(node, "name", None)
-        # Try generic attribute access
-        return getattr(node, property_key, None)
+        return _manifest_node_property(node, property_key)
 
     def _get_from_yaml(
         self,
@@ -1543,61 +1649,37 @@ class PropertyAccessor:
         """
         from dbt_osmosis.core.node_yaml import _get_node_yaml
 
-        # Check if node has a YAML file (ephemeral models may not)
-        if not hasattr(node, "patch_path") or node.patch_path is None:
+        if not _node_has_yaml_patch(node):
             logger.debug(
                 ":page_facing_up: Node %s has no patch_path, skipping YAML access",
-                getattr(node, "unique_id", "unknown"),
+                _node_log_id(node),
             )
             return None
 
         try:
-            # Get the YAML content for this node
             yaml_content = _get_node_yaml(self._context, node)
             if yaml_content is None:
                 logger.debug(
                     ":page_facing_up: No YAML content found for node %s",
-                    getattr(node, "unique_id", "unknown"),
+                    _node_log_id(node),
                 )
                 return None
 
-            # Handle column-level properties
             if column_name:
-                columns = yaml_content.get("columns", [])
-                for column in columns:
-                    if not isinstance(column, t.Mapping):
-                        continue
-                    if column.get("name") == column_name:
-                        if property_key == "tags":
-                            config = column.get("config")
-                            if "tags" not in column and not (
-                                isinstance(config, t.Mapping) and "tags" in config
-                            ):
-                                return None
-                            return _get_effective_column_tags(column)
-                        if property_key == "meta":
-                            config = column.get("config")
-                            if "meta" not in column and not (
-                                isinstance(config, t.Mapping) and "meta" in config
-                            ):
-                                return None
-                            return _get_effective_column_meta(column)
-                        return column.get(property_key)
-                return None
+                return _yaml_column_value(yaml_content, property_key, column_name)
 
-            # Handle node-level properties
             return yaml_content.get(property_key)
 
         except FileNotFoundError:
             logger.warning(
                 ":warning: YAML file not found for node %s, falling back to manifest",
-                getattr(node, "unique_id", "unknown"),
+                _node_log_id(node),
             )
             return None
         except Exception as ex:  # noqa: BLE001
             logger.warning(
                 ":warning: Error reading YAML for node %s: %s",
-                getattr(node, "unique_id", "unknown"),
+                _node_log_id(node),
                 ex,
             )
             return None

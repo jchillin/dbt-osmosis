@@ -1,7 +1,7 @@
 Status: recorded
 Created: 2026-07-05
 Updated: 2026-07-05
-Relates-To: .10x/tickets/2026-07-05-ratify-type-checker-adoption-scope.md
+Relates-To: .10x/tickets/done/2026-07-05-ratify-type-checker-adoption-scope.md
 
 # Type checker adoption scope evidence
 

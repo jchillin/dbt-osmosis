@@ -1,14 +1,14 @@
 Status: recorded
 Created: 2026-07-05
 Updated: 2026-07-05
-Target: .10x/tickets/2026-07-05-reduce-transforms-complexipy-hotspots.md
+Target: .10x/tickets/done/2026-07-05-reduce-transforms-complexipy-hotspots.md
 Verdict: pass
 
 # transforms.py Complexipy refactor review
 
 ## Target
 
-Review of the `src/dbt_osmosis/core/transforms.py` refactor owned by `.10x/tickets/2026-07-05-reduce-transforms-complexipy-hotspots.md`.
+Review of the `src/dbt_osmosis/core/transforms.py` refactor owned by `.10x/tickets/done/2026-07-05-reduce-transforms-complexipy-hotspots.md`.
 
 ## Assumptions tested
 
