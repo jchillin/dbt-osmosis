@@ -105,6 +105,32 @@ def _get_manifest_test_config(test_node: t.Any) -> dict[str, t.Any]:
     return kwargs
 
 
+def _test_attaches_to_node(test_node: t.Any, unique_id: str) -> bool:
+    attached_node = getattr(test_node, "attached_node", None)
+    if attached_node is not None:
+        return attached_node == unique_id
+
+    depends_on = getattr(getattr(test_node, "depends_on", None), "nodes", []) or []
+    return unique_id in depends_on
+
+
+def _test_suggestion_from_manifest_node(
+    test_node: t.Any,
+) -> tuple[str, TestSuggestion] | None:
+    column_name = getattr(test_node, "column_name", None)
+    test_metadata = getattr(test_node, "test_metadata", None)
+    test_name = _get_manifest_test_name(test_metadata)
+    if not column_name or not test_name:
+        return None
+
+    return column_name, TestSuggestion(
+        test_type=test_name,
+        column_name=column_name,
+        config=_get_manifest_test_config(test_node),
+        confidence=1.0,
+    )
+
+
 def _get_existing_tests_for_node(
     manifest: t.Any,
     node: t.Any,
@@ -122,29 +148,13 @@ def _get_existing_tests_for_node(
         if getattr(manifest_node, "resource_type", None) != NodeType.Test:
             continue
 
-        attached_node = getattr(manifest_node, "attached_node", None)
-        if attached_node is not None:
-            if attached_node != unique_id:
-                continue
-        else:
-            depends_on = getattr(getattr(manifest_node, "depends_on", None), "nodes", []) or []
-            if unique_id not in depends_on:
-                continue
-
-        column_name = getattr(manifest_node, "column_name", None)
-        test_metadata = getattr(manifest_node, "test_metadata", None)
-        test_name = _get_manifest_test_name(test_metadata)
-        if not column_name or not test_name:
+        if not _test_attaches_to_node(manifest_node, unique_id):
             continue
 
-        attached_tests[column_name].append(
-            TestSuggestion(
-                test_type=test_name,
-                column_name=column_name,
-                config=_get_manifest_test_config(manifest_node),
-                confidence=1.0,
-            )
-        )
+        suggestion = _test_suggestion_from_manifest_node(manifest_node)
+        if suggestion is not None:
+            column_name, test_suggestion = suggestion
+            attached_tests[column_name].append(test_suggestion)
 
     return dict(attached_tests)
 
