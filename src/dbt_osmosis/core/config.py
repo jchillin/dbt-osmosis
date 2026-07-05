@@ -526,39 +526,65 @@ def _add_cross_project_references(
     Wraps dbt_loom API calls with error handling to prevent failures from breaking
     the manifest loading process.
     """
-    loomnodes: list[t.Any] = []
-    try:
-        loom = dbt_loom.dbtLoom(project_name)
-        loom_manifests = loom.manifests
-    except (AttributeError, KeyError, TypeError) as e:
-        logger.warning(":warning: Failed to load dbt loom manifests: %s", e)
-        return manifest
-    except Exception as e:  # noqa: BLE001
-        logger.warning(":warning: Unexpected error loading dbt loom manifests: %s", e)
+    loom_manifests = _load_loom_manifests(dbt_loom, project_name)
+    if loom_manifests is None:
         return manifest
 
     logger.info(":arrows_counterclockwise: Loaded dbt loom manifests!")
+    loomnodes: list[ModelNode] = []
     for name, loom_manifest in loom_manifests.items():
-        if loom_manifest.get("nodes"):
-            loom_manifest_nodes = loom_manifest.get("nodes")
-            for node in loom_manifest_nodes.values():
-                if node.get("access"):
-                    node_access = node.get("access")
-                    if node_access != "protected" and node.get("resource_type") == "model":
-                        try:
-                            loomnodes.append(ModelNode.from_dict(node))
-                        except Exception as e:  # noqa: BLE001
-                            logger.warning(
-                                ":warning: Failed to parse node %s from dbt loom: %s",
-                                node.get("unique_id", "unknown"),
-                                e,
-                            )
-            for node in loomnodes:
-                manifest.nodes[node.unique_id] = node
-            logger.info(
-                f":arrows_counterclockwise: added {len(loomnodes)} exposed nodes from {name} to the dbt manifest!",
-            )
+        if not loom_manifest.get("nodes"):
+            continue
+        loomnodes.extend(_parse_exposed_loom_nodes(loom_manifest))
+        _merge_loom_nodes(manifest, loomnodes)
+        logger.info(
+            f":arrows_counterclockwise: added {len(loomnodes)} exposed nodes from {name} to the dbt manifest!",
+        )
     return manifest
+
+
+def _load_loom_manifests(dbt_loom: ModuleType, project_name: str) -> t.Mapping[str, t.Any] | None:
+    try:
+        loom = dbt_loom.dbtLoom(project_name)
+        return loom.manifests
+    except (AttributeError, KeyError, TypeError) as e:
+        logger.warning(":warning: Failed to load dbt loom manifests: %s", e)
+    except Exception as e:  # noqa: BLE001
+        logger.warning(":warning: Unexpected error loading dbt loom manifests: %s", e)
+    return None
+
+
+def _iter_exposed_loom_model_dicts(
+    loom_manifest: t.Mapping[str, t.Any],
+) -> t.Iterator[t.Mapping[str, t.Any]]:
+    for node in (loom_manifest.get("nodes") or {}).values():
+        if (
+            node.get("access")
+            and node.get("access") != "protected"
+            and node.get("resource_type") == "model"
+        ):
+            yield node
+
+
+def _parse_exposed_loom_nodes(
+    loom_manifest: t.Mapping[str, t.Any],
+) -> list[ModelNode]:
+    nodes: list[ModelNode] = []
+    for node in _iter_exposed_loom_model_dicts(loom_manifest):
+        try:
+            nodes.append(ModelNode.from_dict(node))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                ":warning: Failed to parse node %s from dbt loom: %s",
+                node.get("unique_id", "unknown"),
+                e,
+            )
+    return nodes
+
+
+def _merge_loom_nodes(manifest: Manifest, nodes: t.Iterable[ModelNode]) -> None:
+    for node in nodes:
+        manifest.nodes[node.unique_id] = node
 
 
 def _bind_project_adapter(project: InterfaceDbtProject) -> None:
