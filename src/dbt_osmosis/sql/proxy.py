@@ -58,6 +58,59 @@ class QueryException(MysqlError):
         self.response: AdapterResponse = response
 
 
+def _looks_like_comment_statement(sql: str, required_terms: tuple[str, ...]) -> bool:
+    """Return True when SQL contains the lightweight prefilter terms."""
+    lower_sql = sql.lower()
+    return all(term in lower_sql for term in required_terms)
+
+
+def _parse_column_comment_request(sql: str) -> dict[str, str] | None:
+    """Parse supported ALTER TABLE ... MODIFY COLUMN ... COMMENT statements."""
+    if not _looks_like_comment_statement(sql, ("alter", "table", "modify", "column", "comment")):
+        return None
+    return _regex_parse_to_complete_dict(sql, ALTER_TABLE_MODIFY_COLUMN_COMMENT)
+
+
+def _parse_table_comment_request(sql: str) -> dict[str, str] | None:
+    """Parse supported ALTER TABLE ... COMMENT statements."""
+    if not _looks_like_comment_statement(sql, ("alter", "table", "comment")):
+        return None
+    return _regex_parse_to_complete_dict(sql, ALTER_TABLE_COMMENT)
+
+
+def _manifest_nodes(project: DbtProjectContext) -> t.Iterator[t.Any]:
+    """Iterate source and model nodes in proxy manifest order."""
+    yield from chain(project.manifest.sources.values(), project.manifest.nodes.values())
+
+
+def _find_manifest_node(project: DbtProjectContext, schema: str, table: str) -> t.Any | None:
+    """Find a manifest node by schema and table name."""
+    ref = (schema, table)
+    return next(
+        (node for node in _manifest_nodes(project) if ref == (node.schema, node.name)),
+        None,
+    )
+
+
+def _apply_column_comment(project: DbtProjectContext, request: dict[str, str]) -> None:
+    """Apply a parsed column comment request to the in-memory manifest."""
+    node = _find_manifest_node(project, request["schema"], request["table"])
+    if node is None:
+        return
+
+    for column in node.columns.values():
+        if column.name == request["column"]:
+            column.description = request["comment"]
+            return
+
+
+def _apply_table_comment(project: DbtProjectContext, request: dict[str, str]) -> None:
+    """Apply a parsed table comment request to the in-memory manifest."""
+    node = _find_manifest_node(project, request["schema"], request["table"])
+    if node is not None:
+        node.description = request["comment"]
+
+
 class DbtSession(Session):
     def __init__(self, project: DbtProjectContext, *args: t.Any, **kwargs: t.Any) -> None:
         super().__init__(*args, **kwargs)
@@ -76,39 +129,14 @@ class DbtSession(Session):
         This middleware updates descriptions only in the in-memory dbt project manifest for the
         current proxy session. It does not write schema YAML or any other durable files to disk.
         """
-        if isinstance(q.expression, exp.Command):
-            lower_sql = q.sql.lower()
-            likely_alter_column_comment = all(
-                k in lower_sql for k in ("alter", "table", "modify", "column", "comment")
-            )
-            if doc_update_req := (
-                likely_alter_column_comment
-                and _regex_parse_to_complete_dict(q.sql, ALTER_TABLE_MODIFY_COLUMN_COMMENT)
-            ):
-                ref = (doc_update_req["schema"], doc_update_req["table"])
-                for node in chain(
-                    self.project.manifest.sources.values(),
-                    self.project.manifest.nodes.values(),
-                ):
-                    if ref == (node.schema, node.name):
-                        for column in node.columns.values():
-                            if column.name == doc_update_req["column"]:
-                                column.description = doc_update_req["comment"]
-                                break
-            likely_alter_table_comment = all(k in lower_sql for k in ("alter", "table", "comment"))
-            if doc_update_req := (
-                likely_alter_table_comment
-                and _regex_parse_to_complete_dict(q.sql, ALTER_TABLE_COMMENT)
-            ):
-                ref = (doc_update_req["schema"], doc_update_req["table"])
-                for node in chain(
-                    self.project.manifest.sources.values(),
-                    self.project.manifest.nodes.values(),
-                ):
-                    if ref == (node.schema, node.name):
-                        node.description = doc_update_req["comment"]
-            return [], []
-        return await q.next()
+        if not isinstance(q.expression, exp.Command):
+            return await q.next()
+
+        if doc_update_req := _parse_column_comment_request(q.sql):
+            _apply_column_comment(self.project, doc_update_req)
+        if doc_update_req := _parse_table_comment_request(q.sql):
+            _apply_table_comment(self.project, doc_update_req)
+        return [], []
 
     async def query(
         self,
