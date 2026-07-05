@@ -115,6 +115,159 @@ def _cleanup_temp_path(temp_path: Path | None) -> None:
             pass
 
 
+def _discard_yaml_cache(path: Path) -> None:
+    with _YAML_BUFFER_CACHE_LOCK:
+        _discard_yaml_caches(path)
+
+
+def _merge_cached_original_sections(path: Path, data: dict[str, t.Any]) -> dict[str, t.Any]:
+    with _YAML_BUFFER_CACHE_LOCK:
+        if path in _YAML_ORIGINAL_CACHE:
+            return _merge_preserved_sections(data, _YAML_ORIGINAL_CACHE[path])
+    return data
+
+
+def _cached_yaml_paths() -> list[Path]:
+    with _YAML_BUFFER_CACHE_LOCK:
+        return list(_YAML_BUFFER_CACHE.keys())
+
+
+def _cached_yaml_data(path: Path) -> dict[str, t.Any]:
+    with _YAML_BUFFER_CACHE_LOCK:
+        data = _YAML_BUFFER_CACHE[path]
+        if path in _YAML_ORIGINAL_CACHE:
+            return _merge_preserved_sections(data, _YAML_ORIGINAL_CACHE[path])
+        return data
+
+
+def _render_yaml_bytes(
+    yaml_handler: ruamel.yaml.YAML,
+    data: dict[str, t.Any],
+    *,
+    strip_eof_blank_lines: bool,
+) -> bytes:
+    with io.BytesIO() as staging:
+        yaml_handler.dump(data, staging)
+        modified = staging.getvalue()
+    return _strip_eof_blank_lines(modified) if strip_eof_blank_lines else modified
+
+
+def _validate_temp_write(temp_path: Path, bytes_written: int, expected: bytes) -> None:
+    if not temp_path.exists():
+        raise OSError(f"Temporary file not created: {temp_path}")
+    if temp_path.stat().st_size == 0 and len(expected) > 0:
+        raise OSError(f"Temporary file is empty: {temp_path}")
+    if bytes_written != len(expected):
+        raise OSError(
+            f"Write incomplete: expected {len(expected)} bytes, wrote {bytes_written}",
+        )
+
+
+def _install_temp_file(temp_path: Path, path: Path, *, allow_overwrite: bool) -> None:
+    if allow_overwrite:
+        _replace_atomically(temp_path, path)
+        return
+
+    try:
+        os.link(temp_path, path)
+    except FileExistsError:
+        raise FileExistsError(f"Refusing to overwrite existing YAML file: {path}") from None
+    finally:
+        _cleanup_temp_path(temp_path)
+
+
+def _write_modified_bytes(
+    path: Path,
+    modified: bytes,
+    *,
+    allow_overwrite: bool,
+    written_file_tracker: t.Callable[[Path], None] | None,
+    error_action: str,
+) -> None:
+    temp_path: Path | None = None
+    try:
+        temp_path, bytes_written = _write_unique_temp_file(path, modified)
+        _validate_temp_write(temp_path, bytes_written, modified)
+        _install_temp_file(temp_path, path, allow_overwrite=allow_overwrite)
+        _discard_yaml_cache(path)
+        if written_file_tracker:
+            written_file_tracker(path)
+    except Exception as e:
+        _cleanup_temp_path(temp_path)
+        logger.error(":boom: Failed to %s YAML to => %s: %s", error_action, path, e)
+        raise
+
+
+def _record_mutation(mutation_tracker: t.Callable[[int], None] | None) -> None:
+    if mutation_tracker:
+        mutation_tracker(1)
+
+
+def _handle_yaml_change(
+    path: Path,
+    modified: bytes,
+    *,
+    dry_run: bool,
+    mutation_tracker: t.Callable[[int], None] | None,
+    written_file_tracker: t.Callable[[Path], None] | None,
+    allow_overwrite: bool,
+    write_message: str,
+    error_action: str,
+) -> None:
+    if dry_run:
+        logger.info(":eyes: Would write changes to => %s (dry-run)", path)
+    else:
+        logger.info(write_message, path)
+        _write_modified_bytes(
+            path,
+            modified,
+            allow_overwrite=allow_overwrite,
+            written_file_tracker=written_file_tracker,
+            error_action=error_action,
+        )
+    _record_mutation(mutation_tracker)
+
+
+def _discard_processed_cache(path: Path, *, dry_run: bool, changed: bool) -> None:
+    if dry_run or not changed:
+        _discard_yaml_cache(path)
+
+
+def _commit_one_yaml(
+    yaml_handler: ruamel.yaml.YAML,
+    path: Path,
+    *,
+    dry_run: bool,
+    mutation_tracker: t.Callable[[int], None] | None,
+    strip_eof_blank_lines: bool,
+    written_file_tracker: t.Callable[[Path], None] | None,
+) -> None:
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+    original = path.read_bytes() if path.is_file() else b""
+    modified = _render_yaml_bytes(
+        yaml_handler,
+        _cached_yaml_data(path),
+        strip_eof_blank_lines=strip_eof_blank_lines,
+    )
+    changed = modified != original
+    if changed:
+        _handle_yaml_change(
+            path,
+            modified,
+            dry_run=dry_run,
+            mutation_tracker=mutation_tracker,
+            written_file_tracker=written_file_tracker,
+            allow_overwrite=True,
+            write_message=":writing_hand: Writing => %s",
+            error_action="commit",
+        )
+    else:
+        logger.debug(":white_check_mark: Skipping => %s (no changes)", path)
+    _discard_processed_cache(path, dry_run=dry_run, changed=changed)
+
+
 def _write_yaml(
     yaml_handler: ruamel.yaml.YAML,
     yaml_handler_lock: threading.Lock,
@@ -143,11 +296,7 @@ def _write_yaml(
     """
     logger.debug(":page_with_curl: Attempting to write YAML to => %s", path)
     with yaml_handler_lock:
-        # Merge preserved sections from original YAML (semantic_models, macros, etc.)
-        with _YAML_BUFFER_CACHE_LOCK:
-            if path in _YAML_ORIGINAL_CACHE:
-                original_content = _YAML_ORIGINAL_CACHE[path]
-                data = _merge_preserved_sections(data, original_content)
+        data = _merge_cached_original_sections(path, data)
 
         if not dry_run:
             if not allow_overwrite and path.exists():
@@ -155,73 +304,27 @@ def _write_yaml(
             path.parent.mkdir(parents=True, exist_ok=True)
 
         original = path.read_bytes() if path.is_file() else b""
-        # Use context manager to ensure BytesIO is properly closed
-        with io.BytesIO() as staging:
-            yaml_handler.dump(data, staging)
-            modified = staging.getvalue()
-            if strip_eof_blank_lines:
-                modified = _strip_eof_blank_lines(modified)
-            if modified != original:
-                if dry_run:
-                    logger.info(":eyes: Would write changes to => %s (dry-run)", path)
-                else:
-                    logger.info(":writing_hand: Writing changes to => %s", path)
+        modified = _render_yaml_bytes(
+            yaml_handler,
+            data,
+            strip_eof_blank_lines=strip_eof_blank_lines,
+        )
+        changed = modified != original
+        if changed:
+            _handle_yaml_change(
+                path,
+                modified,
+                dry_run=dry_run,
+                mutation_tracker=mutation_tracker,
+                written_file_tracker=written_file_tracker,
+                allow_overwrite=allow_overwrite,
+                write_message=":writing_hand: Writing changes to => %s",
+                error_action="write",
+            )
+        else:
+            logger.debug(":white_check_mark: Skipping write => %s (no changes)", path)
 
-                    # Write to a unique temporary file first for safety
-                    temp_path: Path | None = None
-                    try:
-                        temp_path, bytes_written = _write_unique_temp_file(path, modified)
-
-                        # Validate write succeeded
-                        if not temp_path.exists():
-                            raise OSError(f"Temporary file not created: {temp_path}")
-                        if temp_path.stat().st_size == 0 and len(modified) > 0:
-                            raise OSError(f"Temporary file is empty: {temp_path}")
-                        if bytes_written != len(modified):
-                            raise OSError(
-                                f"Write incomplete: expected {len(modified)} bytes, wrote {bytes_written}",
-                            )
-
-                        # Atomic replace: only delete original after successful temp write
-                        if allow_overwrite:
-                            _replace_atomically(temp_path, path)
-                        else:
-                            try:
-                                os.link(temp_path, path)
-                            except FileExistsError:
-                                raise FileExistsError(
-                                    f"Refusing to overwrite existing YAML file: {path}"
-                                ) from None
-                            finally:
-                                _cleanup_temp_path(temp_path)
-                            temp_path = None
-
-                        # Clear cache entry only after successful write
-                        with _YAML_BUFFER_CACHE_LOCK:
-                            _discard_yaml_caches(path)
-
-                        if written_file_tracker:
-                            written_file_tracker(path)
-
-                    except Exception as e:
-                        _cleanup_temp_path(temp_path)
-                        # Re-raise to signal failure
-                        logger.error(":boom: Failed to write YAML to => %s: %s", path, e)
-                        raise
-
-                # Track mutation regardless of dry_run (enables --check with --dry-run)
-                if mutation_tracker:
-                    mutation_tracker(1)
-
-            else:
-                logger.debug(":white_check_mark: Skipping write => %s (no changes)", path)
-
-            # Clear cache entries after truthful disk outcomes. Dry-run writes
-            # always compare against disk but must not pin process-global YAML
-            # state for later reads in the same process.
-            if dry_run or modified == original:
-                with _YAML_BUFFER_CACHE_LOCK:
-                    _discard_yaml_caches(path)
+        _discard_processed_cache(path, dry_run=dry_run, changed=changed)
 
 
 def _replace_atomically(temp_path: Path, target_path: Path) -> None:
@@ -257,75 +360,12 @@ def commit_yamls(
     """
     logger.info(":inbox_tray: Committing all YAMLs from buffer cache to disk.")
     with yaml_handler_lock:
-        with _YAML_BUFFER_CACHE_LOCK:
-            paths = list(_YAML_BUFFER_CACHE.keys())
-        for path in paths:
-            # Ensure parent directory exists before writing
-            if not dry_run:
-                path.parent.mkdir(parents=True, exist_ok=True)
-            original = path.read_bytes() if path.is_file() else b""
-            # Use context manager to ensure BytesIO is properly closed
-            with io.BytesIO() as staging:
-                with _YAML_BUFFER_CACHE_LOCK:
-                    data = _YAML_BUFFER_CACHE[path]
-                    # Merge preserved sections from original YAML (semantic_models, macros, etc.)
-                    if path in _YAML_ORIGINAL_CACHE:
-                        original_content = _YAML_ORIGINAL_CACHE[path]
-                        data = _merge_preserved_sections(data, original_content)
-                yaml_handler.dump(data, staging)
-                modified = staging.getvalue()
-                if strip_eof_blank_lines:
-                    modified = _strip_eof_blank_lines(modified)
-                if modified != original:
-                    if dry_run:
-                        logger.info(":eyes: Would write changes to => %s (dry-run)", path)
-                    else:
-                        logger.info(":writing_hand: Writing => %s", path)
-
-                        # Write to a unique temporary file first for safety
-                        temp_path: Path | None = None
-                        try:
-                            temp_path, bytes_written = _write_unique_temp_file(path, modified)
-
-                            # Validate write succeeded
-                            if not temp_path.exists():
-                                raise OSError(f"Temporary file not created: {temp_path}")
-                            if temp_path.stat().st_size == 0 and len(modified) > 0:
-                                raise OSError(f"Temporary file is empty: {temp_path}")
-                            if bytes_written != len(modified):
-                                raise OSError(
-                                    f"Write incomplete: expected {len(modified)} bytes, wrote {bytes_written}",
-                                )
-
-                            # Atomic replace: only delete original after successful temp write
-                            _replace_atomically(temp_path, path)
-
-                            # Clear cache entry only after successful write
-                            with _YAML_BUFFER_CACHE_LOCK:
-                                _discard_yaml_caches(path)
-
-                            if written_file_tracker:
-                                written_file_tracker(path)
-
-                        except Exception as e:
-                            _cleanup_temp_path(temp_path)
-                            # Re-raise to signal failure
-                            logger.error(":boom: Failed to commit YAML to => %s: %s", path, e)
-                            raise
-
-                    # Track mutation regardless of dry_run (enables --check with --dry-run)
-                    if mutation_tracker:
-                        mutation_tracker(1)
-
-                else:
-                    logger.debug(":white_check_mark: Skipping => %s (no changes)", path)
-                    # Clear cache entry even when no changes (to keep cache consistent)
-                    if not dry_run:
-                        with _YAML_BUFFER_CACHE_LOCK:
-                            _discard_yaml_caches(path)
-
-                # After dry-run mutation reporting, discard every processed
-                # buffered path so follow-up reads reflect disk-backed state.
-                if dry_run:
-                    with _YAML_BUFFER_CACHE_LOCK:
-                        _discard_yaml_caches(path)
+        for path in _cached_yaml_paths():
+            _commit_one_yaml(
+                yaml_handler,
+                path,
+                dry_run=dry_run,
+                mutation_tracker=mutation_tracker,
+                strip_eof_blank_lines=strip_eof_blank_lines,
+                written_file_tracker=written_file_tracker,
+            )
