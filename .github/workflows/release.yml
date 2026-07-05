@@ -196,24 +196,28 @@ jobs:
           fi
 
           tag="v${current_version}"
-
-          if [ "$current_version" = "$previous_version" ]; then
-            echo "No version change detected (${current_version}); building development artifact only."
-            echo "tag=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
           git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}" || true
 
           if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
             tag_commit="$(git rev-list -n 1 "${tag}")"
             head_commit="$(git rev-parse HEAD)"
-            if [ "$tag_commit" != "$head_commit" ]; then
+            if [ "$tag_commit" = "$head_commit" ]; then
+              echo "Using existing release tag ${tag}"
+              echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [ "$current_version" != "$previous_version" ]; then
               echo "::error::${tag} exists at ${tag_commit}, not tested commit ${head_commit}"
               exit 1
             fi
-            echo "Using existing release tag ${tag}"
-            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            echo "No version change detected (${current_version}); existing ${tag} belongs to ${tag_commit}."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$current_version" = "$previous_version" ]; then
+            echo "No version change detected (${current_version}); building development artifact only."
+            echo "tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
