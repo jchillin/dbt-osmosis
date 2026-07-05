@@ -181,13 +181,48 @@ jobs:
           sha="$(git rev-parse --verify --quiet HEAD^)"
           echo "sha=${sha:?}" >> "$GITHUB_OUTPUT"
 
-      - name: Detect and tag new version
+      - name: Detect release tag
         id: check-version
         if: steps.check-parent-commit.outputs.sha
-        uses: salsify/action-detect-and-tag-new-version@2e972ec550a624c846f9f37e87376a6f9f6a682a # v2.0.3
-        with:
-          version-command: |
-            sed -nE 's/^version = "([^"]+)"/\1/p' pyproject.toml
+        run: |
+          set -euo pipefail
+
+          current_version="$(sed -nE 's/^version = "([^"]+)"/\1/p' pyproject.toml)"
+          previous_version="$(git show "${{ steps.check-parent-commit.outputs.sha }}:pyproject.toml" | sed -nE 's/^version = "([^"]+)"/\1/p')"
+
+          if [ -z "$current_version" ]; then
+            echo "::error::Unable to read current version from pyproject.toml"
+            exit 1
+          fi
+
+          tag="v${current_version}"
+
+          if [ "$current_version" = "$previous_version" ]; then
+            echo "No version change detected (${current_version}); building development artifact only."
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git fetch --force origin "refs/tags/${tag}:refs/tags/${tag}" || true
+
+          if git rev-parse --verify --quiet "refs/tags/${tag}" >/dev/null; then
+            tag_commit="$(git rev-list -n 1 "${tag}")"
+            head_commit="$(git rev-parse HEAD)"
+            if [ "$tag_commit" != "$head_commit" ]; then
+              echo "::error::${tag} exists at ${tag_commit}, not tested commit ${head_commit}"
+              exit 1
+            fi
+            echo "Using existing release tag ${tag}"
+            echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Released version ${current_version}"
+          git push origin "refs/tags/${tag}"
+          echo "Created release tag ${tag}"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 
       - name: Bump version for developmental build
         if: "! steps.check-version.outputs.tag"
@@ -202,10 +237,11 @@ jobs:
 
       - name: Publish package on PyPI
         if: steps.check-version.outputs.tag
-        uses: pypa/gh-action-pypi-publish@106e0b0b7c337fa67ed433972f777c6357f78598 # v1.13.0
+        uses: pypa/gh-action-pypi-publish@v1.13.0
         with:
           user: __token__
           password: ${{ secrets.PYPI_TOKEN }}
+          attestations: false
 
       # Release Drafter is the GitHub release notes source for published releases.
       - name: Publish the release notes
