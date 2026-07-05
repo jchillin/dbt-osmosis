@@ -261,6 +261,42 @@ def _is_upstream_model(node: ResultNode, manifest: t.Any) -> bool:
     return dependencies < 5 and dependents > 2
 
 
+def _should_scan_documentation_node(
+    node: ResultNode, min_columns: int, exclude_sources: bool
+) -> bool:
+    if exclude_sources and node.resource_type == "source":
+        return False
+    return len(node.columns) >= min_columns
+
+
+def _model_documentation_gap(
+    node: ResultNode, context: YamlRefactorContextProtocol
+) -> DocumentationGap | None:
+    model_gap = _check_model_documentation(node, context)
+    if model_gap is None:
+        return None
+
+    priority, reason = calculate_priority_score(
+        node, context.project.manifest, model_gap["gap_type"], context
+    )
+    return DocumentationGap(
+        node=node,
+        gap_type=model_gap["gap_type"],
+        description=model_gap["description"],
+        current_doc=node.description,
+        priority=priority,
+        reason=reason,
+    )
+
+
+def _documented_column_count(node: ResultNode, context: YamlRefactorContextProtocol) -> int:
+    return sum(
+        1
+        for col_name, col in node.columns.items()
+        if _check_column_documentation(col_name, col, context)
+    )
+
+
 def discover_undocumented_models(
     context: YamlRefactorContextProtocol,
     min_columns: int = 3,
@@ -286,44 +322,19 @@ def discover_undocumented_models(
     documented_columns = 0
 
     for _, node in _iter_candidate_nodes(context):
-        # Skip sources if requested
-        if exclude_sources and node.resource_type == "source":
-            continue
-
-        # Skip models with too few columns
-        if len(node.columns) < min_columns:
+        if not _should_scan_documentation_node(node, min_columns, exclude_sources):
             continue
 
         total_models += 1
         total_columns += len(node.columns)
 
-        # Check model-level documentation
-        model_gap = _check_model_documentation(node, context)
+        model_gap = _model_documentation_gap(node, context)
         if model_gap:
-            priority, reason = calculate_priority_score(
-                node, context.project.manifest, model_gap["gap_type"], context
-            )
-            gaps.append(
-                DocumentationGap(
-                    node=node,
-                    gap_type=model_gap["gap_type"],
-                    description=model_gap["description"],
-                    current_doc=node.description,
-                    priority=priority,
-                    reason=reason,
-                )
-            )
+            gaps.append(model_gap)
         else:
             documented_models += 1
 
-        # Check column-level documentation
-        for col_name, col in node.columns.items():
-            col_gap = _check_column_documentation(col_name, col, context)
-            if col_gap:
-                documented_columns += 1
-            else:
-                # Column gap - but we score at column level
-                documented_columns += 0
+        documented_columns += _documented_column_count(node, context)
 
     # Calculate coverage
     coverage_percent = (documented_models / total_models * 100) if total_models > 0 else 0.0
