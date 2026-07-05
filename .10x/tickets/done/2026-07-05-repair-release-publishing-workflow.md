@@ -1,4 +1,4 @@
-Status: active
+Status: done
 Created: 2026-07-05
 Updated: 2026-07-05
 
@@ -43,3 +43,6 @@ None.
 ## Progress and Notes
 
 - 2026-07-05: Release attempt `28737697129` validated the candidate successfully, failed once because the workflow tried to create an already-pushed `v1.5.0` tag, and failed again because `pypa/gh-action-pypi-publish` was referenced by annotated tag object SHA and could not pull `ghcr.io/pypa/gh-action-pypi-publish:<sha>`.
+- 2026-07-05: Replaced release tag detection with shell logic that accepts a pre-created tag only when it points at the tested commit, preserves development-build behavior for non-version pushes, and errors on mismatched release tags when a version changed.
+- 2026-07-05: Changed PyPI publishing to use `pypa/gh-action-pypi-publish@v1.13.0` and disabled attestations for token-based publishing.
+- 2026-07-05: Retagged `v1.5.0` to the repaired release commit `af36c6fba4bba7f5774df5004003663773b09ab5`, pushed `main` and the tag, and verified branch/tag Tests, lint, final Release workflow, GitHub release, and PyPI install smoke. Evidence: `.10x/evidence/2026-07-05-release-publishing-workflow-repair.md`. Review: `.10x/reviews/2026-07-05-release-publishing-workflow-repair.md`.
