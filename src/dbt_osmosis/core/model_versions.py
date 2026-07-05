@@ -85,6 +85,63 @@ def _get_member_model_version(member: ResultNode) -> t.Any | None:
     return None
 
 
+def _model_version_entries(model: t.Mapping[str, t.Any]) -> list[t.Any] | None:
+    versions = model.get("versions", [])
+    return versions if isinstance(versions, list) else None
+
+
+def _find_exact_version(
+    versions: list[t.Any],
+    member_version_raw: str | None,
+) -> t.Mapping[str, t.Any] | None:
+    return next(
+        (
+            version
+            for version in versions
+            if isinstance(version, t.Mapping)
+            and _raw_model_version_value(version.get("v")) == member_version_raw
+        ),
+        None,
+    )
+
+
+def _find_equivalent_version(
+    versions: list[t.Any],
+    member_version: t.Any,
+) -> t.Mapping[str, t.Any] | None:
+    return next(
+        (
+            version
+            for version in versions
+            if isinstance(version, t.Mapping)
+            and _version_values_match(version.get("v"), member_version)
+        ),
+        None,
+    )
+
+
+def _selected_model_version(
+    versions: list[t.Any],
+    member_version: t.Any,
+) -> t.Mapping[str, t.Any] | None:
+    exact_match = _find_exact_version(versions, _raw_model_version_value(member_version))
+    return exact_match or _find_equivalent_version(versions, member_version)
+
+
+def _version_with_model_fallbacks(
+    model: t.Mapping[str, t.Any],
+    selected_version: t.Mapping[str, t.Any],
+) -> dict[str, t.Any]:
+    selected = dict(selected_version)
+    selected.setdefault("name", model.get("name"))
+    for fallback_key in ("description", "meta", "tags"):
+        if fallback_key not in selected and fallback_key in model:
+            selected[fallback_key] = model[fallback_key]
+    if not selected.get("description") and "description" in model:
+        selected["description"] = model["description"]
+    return selected
+
+
 def _versioned_model_yaml_view(
     model: t.Mapping[str, t.Any],
     member: ResultNode,
@@ -100,38 +157,11 @@ def _versioned_model_yaml_view(
     if member_version is None:
         return None
 
-    versions = model.get("versions", [])
-    if not isinstance(versions, list):
+    versions = _model_version_entries(model)
+    if versions is None:
         return None
 
-    member_version_raw = _raw_model_version_value(member_version)
-    selected_version = next(
-        (
-            version
-            for version in versions
-            if isinstance(version, t.Mapping)
-            and _raw_model_version_value(version.get("v")) == member_version_raw
-        ),
-        None,
-    )
-    if selected_version is None:
-        selected_version = next(
-            (
-                version
-                for version in versions
-                if isinstance(version, t.Mapping)
-                and _version_values_match(version.get("v"), member_version)
-            ),
-            None,
-        )
+    selected_version = _selected_model_version(versions, member_version)
     if selected_version is None:
         return None
-
-    selected = dict(selected_version)
-    selected.setdefault("name", model.get("name"))
-    for fallback_key in ("description", "meta", "tags"):
-        if fallback_key not in selected and fallback_key in model:
-            selected[fallback_key] = model[fallback_key]
-    if not selected.get("description") and "description" in model:
-        selected["description"] = model["description"]
-    return selected
+    return _version_with_model_fallbacks(model, selected_version)
