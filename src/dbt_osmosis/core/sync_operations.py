@@ -510,6 +510,123 @@ def _finalize_synced_document(
     )
 
 
+def _tables_for_source_scan(source: dict[str, t.Any]) -> list[t.Any]:
+    tables = source.get("tables", [])
+    if not isinstance(tables, list):
+        source_label = source.get("name", "<unknown>")
+        raise YamlValidationError(
+            f"Invalid YAML source '{source_label}': expected 'tables' to be a list before "
+            "matching source tables. Fix the source tables structure before syncing."
+        )
+    return tables
+
+
+def _matching_sources(
+    sources: list[dict[str, t.Any]],
+    match_field: str,
+    match_value: str,
+) -> list[dict[str, t.Any]]:
+    return [
+        source
+        for source in sources
+        if any(table.get(match_field) == match_value for table in _tables_for_source_scan(source))
+    ]
+
+
+def _single_narrowed_source(
+    candidates: list[dict[str, t.Any]],
+    *,
+    field_name: str,
+    field_value: str | None,
+) -> tuple[dict[str, t.Any] | None, list[dict[str, t.Any]]]:
+    if field_value is None:
+        return None, candidates
+
+    narrowed = [source for source in candidates if source.get(field_name) == field_value]
+    if len(narrowed) == 1:
+        return narrowed[0], narrowed
+    return None, narrowed or candidates
+
+
+def _disambiguate_source_candidates(
+    candidates: list[dict[str, t.Any]],
+    *,
+    schema_name: str | None,
+    database_name: str | None,
+) -> dict[str, t.Any] | None:
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+
+    matched_source, narrowed = _single_narrowed_source(
+        candidates,
+        field_name="schema",
+        field_value=schema_name,
+    )
+    if matched_source is not None:
+        return matched_source
+
+    matched_source, narrowed = _single_narrowed_source(
+        narrowed,
+        field_name="database",
+        field_value=database_name,
+    )
+    if matched_source is not None:
+        return matched_source
+    return narrowed[0] if len(narrowed) == 1 else None
+
+
+def _source_table_candidates(
+    sources: list[dict[str, t.Any]],
+    *,
+    table_name: str,
+    table_identifier: str | None,
+) -> list[dict[str, t.Any]]:
+    if table_identifier:
+        candidates = _matching_sources(sources, "identifier", table_identifier)
+        if candidates:
+            return candidates
+    return _matching_sources(sources, "name", table_name)
+
+
+def _find_source_by_table(
+    sources: list[dict[str, t.Any]],
+    *,
+    table_name: str | None,
+    table_identifier: str | None,
+    schema_name: str | None,
+    database_name: str | None,
+) -> tuple[dict[str, t.Any] | None, list[dict[str, t.Any]]]:
+    if not table_name:
+        return None, []
+
+    candidates = _source_table_candidates(
+        sources,
+        table_name=table_name,
+        table_identifier=table_identifier,
+    )
+    return (
+        _disambiguate_source_candidates(
+            candidates,
+            schema_name=schema_name,
+            database_name=database_name,
+        ),
+        candidates,
+    )
+
+
+def _warn_ambiguous_source_match(
+    source_name: str, table_name: str, candidates: list[t.Any]
+) -> None:
+    if candidates:
+        logger.warning(
+            ":warning: Ambiguous source match for %s.%s; creating a new source entry instead of guessing",
+            source_name,
+            table_name,
+        )
+
+
 def _get_or_create_source(
     doc: dict[str, t.Any],
     source_name: str,
@@ -533,73 +650,25 @@ def _get_or_create_source(
         if source.get("name") == source_name:
             return source
 
-    def _tables_for_source_scan(source: dict[str, t.Any]) -> list[t.Any]:
-        tables = source.get("tables", [])
-        if not isinstance(tables, list):
-            source_label = source.get("name", "<unknown>")
-            raise YamlValidationError(
-                f"Invalid YAML source '{source_label}': expected 'tables' to be a list before "
-                "matching source tables. Fix the source tables structure before syncing."
-            )
-        return tables
-
-    def _matching_sources(match_field: str, match_value: str) -> list[dict[str, t.Any]]:
-        return [
-            source
-            for source in sources
-            if any(
-                table.get(match_field) == match_value for table in _tables_for_source_scan(source)
-            )
-        ]
-
-    def _disambiguate(candidates: list[dict[str, t.Any]]) -> dict[str, t.Any] | None:
-        if not candidates:
-            return None
-        if len(candidates) == 1:
-            return candidates[0]
-
-        narrowed = candidates
-        if schema_name is not None:
-            schema_matches = [source for source in narrowed if source.get("schema") == schema_name]
-            if len(schema_matches) == 1:
-                return schema_matches[0]
-            if schema_matches:
-                narrowed = schema_matches
-
-        if database_name is not None:
-            database_matches = [
-                source for source in narrowed if source.get("database") == database_name
-            ]
-            if len(database_matches) == 1:
-                return database_matches[0]
-            if database_matches:
-                narrowed = database_matches
-
-        return narrowed[0] if len(narrowed) == 1 else None
-
     # If no exact match and we have a table name, check for an existing source that can be
     # truthfully identified by table identifier/name plus optional schema/database narrowing.
+    matched_source, candidates = _find_source_by_table(
+        sources,
+        table_name=table_name,
+        table_identifier=table_identifier,
+        schema_name=schema_name,
+        database_name=database_name,
+    )
+    if matched_source is not None:
+        logger.debug(
+            ":link: Reusing source %s for table %s (node source_name is %s)",
+            matched_source.get("name"),
+            table_name,
+            source_name,
+        )
+        return matched_source
     if table_name:
-        candidates = _matching_sources("identifier", table_identifier) if table_identifier else []
-        if not candidates:
-            candidates = _matching_sources("name", table_name)
-
-        matched_source = _disambiguate(candidates)
-        if matched_source is not None:
-            logger.debug(
-                ":link: Reusing source %s for table %s (node source_name is %s)",
-                matched_source.get("name"),
-                table_name,
-                source_name,
-            )
-            return matched_source
-
-        if candidates:
-            logger.warning(
-                ":warning: Ambiguous source match for %s.%s; creating a new source entry instead of guessing",
-                source_name,
-                table_name,
-            )
+        _warn_ambiguous_source_match(source_name, table_name, candidates)
 
     # Create new source
     new_source = {"name": source_name, "tables": []}
@@ -682,41 +751,84 @@ def _get_or_create_model(doc_list: list[dict[str, t.Any]], model_name: str) -> d
     return doc_model
 
 
+def _version_duplicate_entry(
+    valid_version_entries: list[tuple[int, int | float | str]],
+    v_value: t.Any,
+) -> tuple[int, int | float | str] | None:
+    from dbt_osmosis.core.inheritance import _version_values_match
+
+    return next(
+        (
+            (seen_idx, seen_value)
+            for seen_idx, seen_value in valid_version_entries
+            if _version_values_match(seen_value, v_value)
+        ),
+        None,
+    )
+
+
+def _raise_duplicate_version_entry(
+    *,
+    model_name: str,
+    duplicate_entry: tuple[int, int | float | str],
+    version_idx: int,
+    v_value: t.Any,
+) -> None:
+    raise YamlValidationError(
+        f"Duplicate YAML version entries for model '{model_name}' at versions indexes "
+        f"{duplicate_entry[0]} and {version_idx} identify the same version "
+        f"({duplicate_entry[1]!r} and {v_value!r}). dbt-osmosis refuses to sync "
+        "because choosing one entry would delete user-authored YAML content. "
+        "Consolidate duplicate models[].versions[] entries before syncing."
+    )
+
+
+def _index_version_entry(
+    *,
+    model_name: str,
+    version_idx: int,
+    version: t.Mapping[str, t.Any],
+    valid_version_entries: list[tuple[int, int | float | str]],
+    version_by_v: dict[str, dict[str, t.Any]],
+) -> None:
+    from dbt_osmosis.core.inheritance import _raw_model_version_value
+
+    v_value = version.get("v")
+    v_key = _raw_model_version_value(v_value)
+    if v_key is None:
+        return
+
+    duplicate_entry = _version_duplicate_entry(valid_version_entries, v_value)
+    if duplicate_entry is not None:
+        _raise_duplicate_version_entry(
+            model_name=model_name,
+            duplicate_entry=duplicate_entry,
+            version_idx=version_idx,
+            v_value=v_value,
+        )
+    if not isinstance(v_value, bool) and isinstance(v_value, (int, float, str)):
+        valid_version_entries.append((version_idx, v_value))
+    version_by_v[v_key] = t.cast("dict[str, t.Any]", version)
+
+
 def _deduplicate_versions(doc_model: dict[str, t.Any]) -> dict[str, dict[str, t.Any]]:
     """Index version entries by version number and fail closed on duplicates.
 
     Returns a dict mapping version numbers to version dicts.
     """
-    from dbt_osmosis.core.inheritance import _raw_model_version_value, _version_values_match
-
     model_name = doc_model.get("name", "<unknown>")
     valid_version_entries: list[tuple[int, int | float | str]] = []
     version_by_v: dict[str, dict[str, t.Any]] = {}
     for version_idx, version in enumerate(doc_model.get("versions", [])):
         if not isinstance(version, t.Mapping):
             continue
-        v_value = version.get("v")
-        v_key = _raw_model_version_value(v_value)
-        if v_key is not None:
-            duplicate_entry = next(
-                (
-                    (seen_idx, seen_value)
-                    for seen_idx, seen_value in valid_version_entries
-                    if _version_values_match(seen_value, v_value)
-                ),
-                None,
-            )
-            if duplicate_entry is not None:
-                raise YamlValidationError(
-                    f"Duplicate YAML version entries for model '{model_name}' at versions indexes "
-                    f"{duplicate_entry[0]} and {version_idx} identify the same version "
-                    f"({duplicate_entry[1]!r} and {v_value!r}). dbt-osmosis refuses to sync "
-                    "because choosing one entry would delete user-authored YAML content. "
-                    "Consolidate duplicate models[].versions[] entries before syncing."
-                )
-            if not isinstance(v_value, bool) and isinstance(v_value, (int, float, str)):
-                valid_version_entries.append((version_idx, v_value))
-            version_by_v[v_key] = t.cast("dict[str, t.Any]", version)
+        _index_version_entry(
+            model_name=model_name,
+            version_idx=version_idx,
+            version=version,
+            valid_version_entries=valid_version_entries,
+            version_by_v=version_by_v,
+        )
     return version_by_v
 
 
@@ -797,31 +909,55 @@ def _sync_model_or_seed_node(
         _sync_non_versioned_node(context, node, doc_model)
 
 
+def _raise_duplicate_sync_entry(
+    *,
+    resource_key: str,
+    name: str,
+    first_index: int,
+    duplicate_index: int,
+    target_path: Path,
+) -> None:
+    raise YamlValidationError(
+        f"Duplicate YAML {resource_key} entries for '{name}' in {target_path} at "
+        f"{resource_key} indexes {first_index} and {duplicate_index}. dbt-osmosis refuses "
+        "to sync because choosing one entry would delete user-authored YAML content. "
+        f"Consolidate duplicate {resource_key} entries before syncing."
+    )
+
+
+def _validate_unique_resource_entries(
+    resource_key: str,
+    entries: list[t.Any],
+    target_path: Path,
+) -> None:
+    seen_names: dict[str, int] = {}
+    for idx, entry in enumerate(entries):
+        if not isinstance(entry, t.Mapping):
+            continue
+        name = entry.get("name")
+        if not isinstance(name, str):
+            continue
+        if name in seen_names:
+            _raise_duplicate_sync_entry(
+                resource_key=resource_key,
+                name=name,
+                first_index=seen_names[name],
+                duplicate_index=idx,
+                target_path=target_path,
+            )
+        seen_names[name] = idx
+
+        if resource_key == "models":
+            _deduplicate_versions(t.cast("dict[str, t.Any]", entry))
+
+
 def _validate_no_duplicate_sync_entries(doc: dict[str, t.Any], target_path: Path) -> None:
     """Fail before syncing when one YAML document has duplicate writable entries."""
     for resource_key in ("models", "seeds"):
         entries = doc.get(resource_key, [])
         if not isinstance(entries, list):
             continue
-
-        seen_names: dict[str, int] = {}
-        for idx, entry in enumerate(entries):
-            if not isinstance(entry, t.Mapping):
-                continue
-            name = entry.get("name")
-            if not isinstance(name, str):
-                continue
-            if name in seen_names:
-                raise YamlValidationError(
-                    f"Duplicate YAML {resource_key} entries for '{name}' in {target_path} at "
-                    f"{resource_key} indexes {seen_names[name]} and {idx}. dbt-osmosis refuses "
-                    "to sync because choosing one entry would delete user-authored YAML content. "
-                    f"Consolidate duplicate {resource_key} entries before syncing."
-                )
-            seen_names[name] = idx
-
-            if resource_key == "models":
-                _deduplicate_versions(t.cast("dict[str, t.Any]", entry))
+        _validate_unique_resource_entries(resource_key, entries, target_path)
 
 
 def _preflight_sync_group(context: YamlRefactorContextProtocol, nodes: list[ResultNode]) -> None:
