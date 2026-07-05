@@ -510,75 +510,102 @@ def run_profile(minimal: bool = True) -> None:
         state.app.profile_html = convert_profile_report_to_html(build_profile_report(minimal))
 
 
-def main():
-    args = _parse_args()
+def _new_dashboard_app() -> SimpleNamespace:
+    """Create the workbench app namespace and dashboard components."""
+    board = Dashboard()
+    return SimpleNamespace(
+        model="SCRATCH",
+        dashboard=board,
+        editor=Editor(board, 0, 0, 6, 11, minW=3, minH=3, compile_action=compile),
+        renderer=Renderer(board, 6, 0, 6, 11, minW=3, minH=3),
+        preview=Preview(board, 0, 11, 12, 9, minW=3, minH=3, query_action=run_query),
+        profiler=Profiler(board, 0, 20, 8, 9, minW=3, minH=3, prof_action=run_profile),
+        ai_assistant=AIAssistant(board, 8, 20, 4, 9, minW=3, minH=3),
+        feed=RssFeed(board, 12, 20, 4, 9, minW=3, minH=3),
+    )
 
-    st.title("dbt-osmosis 🌊")
 
+def _apply_dashboard_initial_state(app: SimpleNamespace) -> None:
+    """Copy component initial state into st.session_state.app."""
+    for value in vars(app).copy().values():
+        if isinstance(value, Dashboard.Item):
+            for key, state_val in value.initial_state().items():
+                setattr(app, key, state_val)
+
+
+def _workbench_paths(args: dict[str, t.Any]) -> tuple[str, str]:
+    """Return project and profiles directories for the workbench."""
+    proj_dir = args.get("project_dir") or discover_project_dir()
+    prof_dir = args.get("profiles_dir") or discover_profiles_dir()
+    return t.cast("str", proj_dir), t.cast("str", prof_dir)
+
+
+def _initial_query_for_project(project_dir: str) -> str:
+    """Return the initial workbench SQL for a project path."""
+    if project_dir.rstrip(os.path.sep).endswith(("demo_sqlite", "demo_duckdb")):
+        return _get_demo_query()
+    return default_prompt
+
+
+def _initialize_app(args: dict[str, t.Any]) -> SimpleNamespace:
+    """Initialize st.session_state.app for the first workbench render."""
+    app = _new_dashboard_app()
+    _apply_dashboard_initial_state(app)
+    state.app = app
+
+    proj_dir, prof_dir = _workbench_paths(args)
+    app.all_profiles = dbt_profile.read_profile(prof_dir)
+    app.query = _initial_query_for_project(proj_dir)
+    app.ctx = create_dbt_project_context(
+        config=DbtConfiguration(project_dir=proj_dir, profiles_dir=prof_dir),
+    )
+    app.target_name = app.ctx.runtime_cfg.target_name
+    app.editor.tabs[EditorTab.SQL]["content"] = app.query
+    app.compiled_query = compile(app.query) if app.query else ""
+    app.model_nodes = _model_nodes_for_context(app.ctx)
+    app.editor.update_content("SQL", app.query)
+    app.feed_html = build_feed_html(enable_external_feed=bool(args.get("enable_external_feed")))
+    return app
+
+
+def _workbench_app(args: dict[str, t.Any]) -> SimpleNamespace:
+    """Return existing workbench state or initialize it."""
     if "app" not in state:
-        # Initialize state
-        board = Dashboard()
+        return _initialize_app(args)
+    return state.app
 
-        app = SimpleNamespace(
-            model="SCRATCH",
-            dashboard=board,
-            editor=Editor(board, 0, 0, 6, 11, minW=3, minH=3, compile_action=compile),
-            renderer=Renderer(board, 6, 0, 6, 11, minW=3, minH=3),
-            preview=Preview(board, 0, 11, 12, 9, minW=3, minH=3, query_action=run_query),
-            profiler=Profiler(board, 0, 20, 8, 9, minW=3, minH=3, prof_action=run_profile),
-            ai_assistant=AIAssistant(board, 8, 20, 4, 9, minW=3, minH=3),
-            feed=RssFeed(board, 12, 20, 4, 9, minW=3, minH=3),
-        )
-        for v in vars(app).copy().values():
-            if isinstance(v, Dashboard.Item):
-                for k, state_val in v.initial_state().items():
-                    setattr(app, k, state_val)
 
-        state.app = app
+def _register_dashboard_hotkeys() -> None:
+    """Register dashboard keyboard shortcuts."""
+    event.Hotkey("ctrl+enter", sync(), bindInputs=True, overrideDefault=True)
+    event.Hotkey("command+s", sync(), bindInputs=True, overrideDefault=True)
+    event.Hotkey("ctrl+shift+enter", run_query, bindInputs=True, overrideDefault=True)
+    event.Hotkey("command+shift+s", run_query, bindInputs=True, overrideDefault=True)
 
-        proj_dir = args.get("project_dir") or discover_project_dir()
-        prof_dir = args.get("profiles_dir") or discover_profiles_dir()
 
-        app.all_profiles = dbt_profile.read_profile(prof_dir)
+def _render_dashboard(app: SimpleNamespace) -> None:
+    """Render dashboard components."""
+    with app.dashboard(rowHeight=57):
+        app.editor()
+        app.renderer()
+        app.preview()
+        app.profiler()
+        app.ai_assistant()
+        app.feed()
 
-        if proj_dir.rstrip(os.path.sep).endswith(("demo_sqlite", "demo_duckdb")):
-            app.query = _get_demo_query()
-        else:
-            app.query = default_prompt
 
-        app.ctx = create_dbt_project_context(
-            config=DbtConfiguration(project_dir=proj_dir, profiles_dir=prof_dir),
-        )
-        app.target_name = app.ctx.runtime_cfg.target_name
-
-        app.editor.tabs[EditorTab.SQL]["content"] = app.query
-        app.compiled_query = compile(app.query) if app.query else ""
-
-        app.model_nodes = _model_nodes_for_context(app.ctx)
-
-        app.editor.update_content("SQL", app.query)
-
-        app.feed_html = build_feed_html(enable_external_feed=bool(args.get("enable_external_feed")))
-    else:
-        app = state.app
+def main() -> None:
+    args = _parse_args()
+    st.title("dbt-osmosis 🌊")
+    app = _workbench_app(args)
 
     ctx: DbtProject = app.ctx
 
     sidebar(ctx)
 
     with elements("dashboard"):  # pyright: ignore[reportGeneralTypeIssues]
-        event.Hotkey("ctrl+enter", sync(), bindInputs=True, overrideDefault=True)
-        event.Hotkey("command+s", sync(), bindInputs=True, overrideDefault=True)
-        event.Hotkey("ctrl+shift+enter", run_query, bindInputs=True, overrideDefault=True)
-        event.Hotkey("command+shift+s", run_query, bindInputs=True, overrideDefault=True)
-
-        with app.dashboard(rowHeight=57):
-            app.editor()
-            app.renderer()
-            app.preview()
-            app.profiler()
-            app.ai_assistant()
-            app.feed()
+        _register_dashboard_hotkeys()
+        _render_dashboard(app)
 
 
 if __name__ == "__main__":
