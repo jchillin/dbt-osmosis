@@ -56,6 +56,7 @@ from dbt_osmosis.core.introspection import (
 
 # Natural language generation (from llm.py) - conditional on openai availability
 _llm_available = importlib.util.find_spec("openai") is not None
+_PRIVATE_COMPAT_EXPORT_NAMES = [_get_setting_for_node.__name__]
 
 if TYPE_CHECKING:
     from dbt_osmosis.core.llm import (
@@ -321,7 +322,7 @@ __all__ = list(
         "_find_first",
         "SettingsResolver",
         "PropertyAccessor",
-        "_get_setting_for_node",
+        *_PRIVATE_COMPAT_EXPORT_NAMES,
         "_maybe_use_precise_dtype",
         "_topological_sort",
         "MissingOsmosisConfig",
@@ -356,7 +357,7 @@ __all__ = list(
         "_build_node_ancestor_tree",
         "_find_first",
         "_get_node_yaml",
-        "_get_setting_for_node",
+        *_PRIVATE_COMPAT_EXPORT_NAMES,
         "_get_yaml_path_template",
         "_maybe_use_precise_dtype",
         "_reload_manifest",

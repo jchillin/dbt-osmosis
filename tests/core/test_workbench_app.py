@@ -193,7 +193,7 @@ def test_workbench_change_target_rebuilds_context_and_closes_old_context(monkeyp
         "compile_sql_code",
         lambda ctx, sql: _CompiledNode(f"{ctx.runtime_cfg.target_name}: {sql}"),
     )
-    monkeypatch.setattr(app, "set_invocation_context", lambda env: None)
+    monkeypatch.setattr(app, "set_invocation_context", lambda _env: None)
     monkeypatch.setattr(app, "get_env", dict)
 
     app.change_target()
@@ -234,7 +234,7 @@ def test_workbench_change_target_failure_keeps_old_context_and_reports_error(mon
         "create_dbt_project_context",
         lambda config: (_ for _ in ()).throw(RuntimeError("bad target")),
     )
-    monkeypatch.setattr(app, "set_invocation_context", lambda env: None)
+    monkeypatch.setattr(app, "set_invocation_context", lambda _env: None)
     monkeypatch.setattr(app, "get_env", dict)
 
     app.change_target()

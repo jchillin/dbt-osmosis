@@ -6,6 +6,8 @@ from unittest import mock
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("fresh_caches")
+
 from dbt_osmosis.core.path_management import create_missing_source_yamls
 from dbt_osmosis.core.restructuring import (
     RestructureDeltaPlan,
@@ -53,7 +55,7 @@ def _build_source_bootstrap_context(tmp_path: Path, *, dry_run: bool) -> YamlRef
     )
 
 
-def test_create_missing_source_yamls(yaml_context: YamlRefactorContext, fresh_caches):
+def test_create_missing_source_yamls(yaml_context: YamlRefactorContext):
     """Creates missing source YAML files if any are declared in dbt-osmosis sources
     but do not exist in the manifest. Typically, might be none in your project.
     """
@@ -109,7 +111,6 @@ def test_create_missing_source_yamls_dry_run_skips_reload(tmp_path: Path):
 
 def test_create_missing_source_yamls_does_not_leak_database_override_between_sources(
     tmp_path: Path,
-    fresh_caches,
 ):
     """Each source bootstrap should resolve its database independently from the runtime default."""
     import yaml
@@ -160,7 +161,7 @@ def test_create_missing_source_yamls_does_not_leak_database_override_between_sou
     reload_manifest.assert_called_once_with(context.project)
 
 
-def test_draft_restructure_delta_plan(yaml_context: YamlRefactorContext, fresh_caches):
+def test_draft_restructure_delta_plan(yaml_context: YamlRefactorContext):
     """Ensures we can generate a restructure plan for real models and sources.
     Usually, this plan might be empty if everything lines up already.
     """
@@ -168,7 +169,7 @@ def test_draft_restructure_delta_plan(yaml_context: YamlRefactorContext, fresh_c
     assert plan is not None
 
 
-def test_apply_restructure_plan(yaml_context: YamlRefactorContext, fresh_caches):
+def test_apply_restructure_plan(yaml_context: YamlRefactorContext):
     """Applies the restructure plan for the real project (in dry_run mode).
     Should not raise errors even if the plan is empty or small.
     """
@@ -178,7 +179,6 @@ def test_apply_restructure_plan(yaml_context: YamlRefactorContext, fresh_caches)
 
 def test_apply_restructure_plan_dry_run_skips_reload(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
     tmp_path: Path,
 ):
     """Dry-run restructure should not claim an on-disk change by reloading the manifest."""
@@ -204,7 +204,6 @@ def test_apply_restructure_plan_dry_run_skips_reload(
 def test_apply_restructure_plan_counts_deleted_files_as_disk_mutations(
     yaml_context: YamlRefactorContext,
     tmp_path: Path,
-    fresh_caches,
 ):
     """Restructure tracks both the new file write and the superseded file deletion truthfully."""
     from unittest import mock as mock_patch
@@ -269,7 +268,6 @@ def test_pretty_print_plan(caplog):
 
 def test_apply_restructure_plan_confirm_prompt(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
     capsys,
 ):
     """We test apply_restructure_plan with confirm=True, mocking input to 'n' to skip it.
@@ -292,7 +290,6 @@ def test_apply_restructure_plan_confirm_prompt(
 
 def test_apply_restructure_plan_confirm_yes(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
     capsys,
 ):
     """Same as above, but we input 'y' so it actually proceeds with the plan.
@@ -798,7 +795,6 @@ def test_partial_superseded_file_preserved(yaml_context: YamlRefactorContext, tm
 def test_superseded_file_with_unmanaged_top_level_content_is_preserved(
     yaml_context: YamlRefactorContext,
     tmp_path: Path,
-    fresh_caches,
 ):
     """Superseded cleanup must not delete files that still contain unmanaged sections."""
     from unittest import mock as mock_patch
@@ -858,7 +854,6 @@ def test_superseded_file_with_unmanaged_top_level_content_is_preserved(
 def test_superseded_file_with_unmanaged_content_is_preserved_when_original_cache_missing(
     yaml_context: YamlRefactorContext,
     tmp_path: Path,
-    fresh_caches,
 ):
     """Superseded cleanup must fail closed if the unfiltered original cache is missing."""
     from unittest import mock as mock_patch
@@ -918,7 +913,6 @@ def test_superseded_file_with_unmanaged_content_is_preserved_when_original_cache
 def test_dry_run_unmanaged_superseded_file_with_missing_original_cache_is_not_stale_cached(
     yaml_context: YamlRefactorContext,
     tmp_path: Path,
-    fresh_caches,
 ):
     """Dry-run must not delete unmanaged superseded files or leave stale YAML caches."""
     from unittest import mock as mock_patch
@@ -983,7 +977,6 @@ def test_dry_run_unmanaged_superseded_file_with_missing_original_cache_is_not_st
 def test_same_path_superseded_file_preserves_rewritten_managed_and_unmanaged_content(
     yaml_context: YamlRefactorContext,
     tmp_path: Path,
-    fresh_caches,
 ):
     """Same-path superseded entries should not remove the just-written managed section."""
     from unittest import mock as mock_patch
@@ -1039,7 +1032,7 @@ def test_same_path_superseded_file_preserves_rewritten_managed_and_unmanaged_con
 # ============================================================================
 
 
-def test_catalog_data_type_used_in_sync(yaml_context: YamlRefactorContext, fresh_caches):
+def test_catalog_data_type_used_in_sync(yaml_context: YamlRefactorContext):
     """Behavior test: Verify that data types from catalog are used when
     --catalog-path is provided. Catalog data types should take precedence
     over manifest data types.
@@ -1125,7 +1118,6 @@ def test_catalog_data_type_used_in_sync(yaml_context: YamlRefactorContext, fresh
 
 def test_sync_without_catalog_falls_back_to_manifest(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Behavior test: Verify that when no catalog is available, sync falls back
     to manifest data types.

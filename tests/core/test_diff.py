@@ -5,6 +5,8 @@ from unittest import mock
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("fresh_caches")
+
 from dbt_osmosis.core.diff import (
     ChangeCategory,
     ChangeSeverity,
@@ -37,7 +39,7 @@ def _patched_node_columns(node, columns):
         node.columns = original_columns
 
 
-def test_schema_diff_initialization(yaml_context: YamlRefactorContext, fresh_caches):
+def test_schema_diff_initialization(yaml_context: YamlRefactorContext):
     """Test that SchemaDiff can be initialized with a context."""
     differ = SchemaDiff(yaml_context)
     assert differ._context == yaml_context
@@ -45,19 +47,19 @@ def test_schema_diff_initialization(yaml_context: YamlRefactorContext, fresh_cac
     assert differ._rename_detection_enabled is True
 
 
-def test_schema_diff_custom_threshold(yaml_context: YamlRefactorContext, fresh_caches):
+def test_schema_diff_custom_threshold(yaml_context: YamlRefactorContext):
     """Test that SchemaDiff accepts custom fuzzy match threshold."""
     differ = SchemaDiff(yaml_context, fuzzy_match_threshold=90.0)
     assert differ._fuzzy_match_threshold == 90.0
 
 
-def test_schema_diff_disable_renames(yaml_context: YamlRefactorContext, fresh_caches):
+def test_schema_diff_disable_renames(yaml_context: YamlRefactorContext):
     """Test that SchemaDiff can disable rename detection."""
     differ = SchemaDiff(yaml_context, detect_column_renames=False)
     assert differ._rename_detection_enabled is False
 
 
-def test_schema_diff_compare_node(yaml_context: YamlRefactorContext, fresh_caches):
+def test_schema_diff_compare_node(yaml_context: YamlRefactorContext):
     """Test comparing a single node's schema."""
     import datetime
 
@@ -82,7 +84,6 @@ def test_schema_diff_compare_node(yaml_context: YamlRefactorContext, fresh_cache
 
 def test_schema_diff_detects_renamed_columns_without_context_node(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Rename detection should use the compared node, not mutable context state."""
     from dbt_common.contracts.metadata import ColumnMetadata
@@ -169,7 +170,7 @@ def test_schema_diff_rename_output_is_deterministic_for_ambiguous_candidates(
     ]
 
 
-def test_schema_diff_compare_all(yaml_context: YamlRefactorContext, fresh_caches):
+def test_schema_diff_compare_all(yaml_context: YamlRefactorContext):
     """Test comparing all nodes in the manifest."""
     differ = SchemaDiff(yaml_context)
     results = differ.compare_all()
@@ -181,7 +182,7 @@ def test_schema_diff_compare_all(yaml_context: YamlRefactorContext, fresh_caches
         assert result.has_changes is True
 
 
-def test_schema_diff_result_properties(yaml_context: YamlRefactorContext, fresh_caches):
+def test_schema_diff_result_properties(yaml_context: YamlRefactorContext):
     """Test SchemaDiffResult properties."""
     differ = SchemaDiff(yaml_context)
 
@@ -219,7 +220,6 @@ def test_schema_diff_result_properties(yaml_context: YamlRefactorContext, fresh_
 
 def test_schema_diff_type_difference_ignores_case_only_changes(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Case-only type differences should not emit type changes."""
     from dbt_common.contracts.metadata import ColumnMetadata
@@ -239,7 +239,6 @@ def test_schema_diff_type_difference_ignores_case_only_changes(
 
 def test_schema_diff_honors_output_to_upper_for_case_only_column_names(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Configured output casing should not create add/remove noise for case-only names."""
     from dbt_common.contracts.metadata import ColumnMetadata
@@ -266,7 +265,6 @@ def test_schema_diff_honors_output_to_upper_for_case_only_column_names(
 
 def test_schema_diff_honors_output_case_settings_without_hiding_real_changes(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     from dbt_common.contracts.metadata import ColumnMetadata
 
@@ -316,7 +314,6 @@ def test_schema_diff_honors_output_case_settings_without_hiding_real_changes(
 
 def test_schema_diff_remains_case_sensitive_without_output_case_conversion(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     from dbt_common.contracts.metadata import ColumnMetadata
 
@@ -349,7 +346,6 @@ def test_schema_diff_remains_case_sensitive_without_output_case_conversion(
 
 def test_schema_diff_type_difference_ignores_whitespace_only_changes(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Whitespace-only type differences should not emit type changes."""
     from dbt_common.contracts.metadata import ColumnMetadata
@@ -374,7 +370,6 @@ def test_schema_diff_type_difference_ignores_whitespace_only_changes(
 
 def test_schema_diff_type_difference_preserves_original_type_strings(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Real type changes should report the original YAML and database strings."""
     from dbt_common.contracts.metadata import ColumnMetadata

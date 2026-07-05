@@ -18,6 +18,7 @@ import yaml as yaml_handler
 from dbt_osmosis.core import logger
 from dbt_osmosis.core.config import (
     DbtConfiguration,
+    DbtProjectContext,
     create_dbt_project_context,
     discover_profiles_dir,
     discover_project_dir,
@@ -255,6 +256,21 @@ def _resolve_profiles_dir(
     if profiles_dir is not None:
         return profiles_dir
     return discover_profiles_dir(project_dir)
+
+
+def _create_cli_project_context(
+    project_dir: str | None,
+    profiles_dir: str | None,
+    target: str | None,
+    **kwargs: t.Any,
+) -> DbtProjectContext:
+    settings = DbtConfiguration(
+        project_dir=t.cast(str, project_dir),
+        profiles_dir=t.cast(str, profiles_dir),
+        target=target,
+        **kwargs,
+    )
+    return create_dbt_project_context(settings)
 
 
 def yaml_opts(func: t.Callable[P, T]) -> t.Callable[P, T]:
@@ -1163,13 +1179,7 @@ def model(
     and generate a complete dbt model with SQL and documentation.
     """
     logger.info(":water_wave: Executing dbt-osmosis natural language generation\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
-        **kwargs,
-    )
-    project = create_dbt_project_context(settings)
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
     _run_model_generation(
         project,
         project_dir,
@@ -1252,13 +1262,7 @@ def sources(
     This command discovers tables in your database and generates dbt source YAML definitions.
     """
     logger.info(":water_wave: Executing dbt-osmosis source generation\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
-        **kwargs,
-    )
-    project = create_dbt_project_context(settings)
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
 
     result = generate_sources_from_database(
         context=project,
@@ -1347,13 +1351,7 @@ def staging(
     generation via dbt-core-interface.
     """
     logger.info(":water_wave: Executing dbt-osmosis staging generation\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
-        **kwargs,
-    )
-    project = create_dbt_project_context(settings)
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
 
     try:
         result = generate_staging_from_source(
@@ -1409,13 +1407,7 @@ def generate_query(
     The AI will translate your natural language query into SQL using dbt's ref() syntax.
     """
     logger.info(":water_wave: Executing dbt-osmosis natural language SQL generation\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
-        **kwargs,
-    )
-    project = create_dbt_project_context(settings)
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
     _run_sql_generation(project, query, execute)
 
 
@@ -1476,13 +1468,7 @@ def nl_generate_deprecated(
         "Use `dbt-osmosis generate model` instead."
     )
     logger.info(":water_wave: Executing dbt-osmosis natural language generation\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
-        **kwargs,
-    )
-    project = create_dbt_project_context(settings)
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
     _run_model_generation(
         project,
         project_dir,
@@ -1521,13 +1507,7 @@ def query(
     The AI will translate your natural language query into SQL using dbt's ref() syntax.
     """
     logger.info(":water_wave: Executing dbt-osmosis natural language SQL generation\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
-        **kwargs,
-    )
-    project = create_dbt_project_context(settings)
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
     _run_sql_generation(project, query, execute)
 
 
@@ -1633,13 +1613,7 @@ def run(
     **kwargs: t.Any,
 ) -> None:
     """Executes a dbt SQL statement writing results to stdout"""
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
-        **kwargs,
-    )
-    project = create_dbt_project_context(settings)
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
     _, table = execute_sql_code(project, sql)
 
     t.cast("t.Any", table).print_table(
@@ -1664,13 +1638,7 @@ def compile(
     **kwargs: t.Any,
 ) -> None:
     """Compiles a dbt SQL statement and writes the result to stdout"""
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
-        **kwargs,
-    )
-    project = create_dbt_project_context(settings)
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
     node = compile_sql_code(project, sql)
 
     print(node.compiled_code)
@@ -2308,6 +2276,33 @@ def _rule_options(
     return enabled_rules, disabled_rules
 
 
+def _sql_lint_inputs(
+    project_dir: str | None,
+    profiles_dir: str | None,
+    target: str | None,
+    dialect: str | None,
+    rules: tuple[str, ...],
+    disable_rules: tuple[str, ...],
+    **kwargs: t.Any,
+) -> tuple[DbtProjectContext, str, list[str] | None, list[str] | None]:
+    project = _create_cli_project_context(project_dir, profiles_dir, target, **kwargs)
+    sql_dialect = dialect or project.adapter.type()
+    enabled_rules, disabled_rules = _rule_options(rules, disable_rules)
+    return project, sql_dialect, enabled_rules, disabled_rules
+
+
+def _sql_linter(
+    sql_dialect: str,
+    enabled_rules: list[str] | None,
+    disabled_rules: list[str] | None,
+) -> SQLLinter:
+    return SQLLinter(
+        dialect=sql_dialect,
+        enabled_rules=enabled_rules,
+        disabled_rules=disabled_rules,
+    )
+
+
 def _echo_violation_section(title: str, violations: list[LintViolation]) -> None:
     if not violations:
         return
@@ -2421,19 +2416,15 @@ def lint_file(
     This command analyzes SQL code for style issues, anti-patterns, and potential bugs.
     """
     logger.info(":water_wave: Executing dbt-osmosis SQL linting\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
+    project, sql_dialect, enabled_rules, disabled_rules = _sql_lint_inputs(
+        project_dir,
+        profiles_dir,
+        target,
+        dialect,
+        rules,
+        disable_rules,
         **kwargs,
     )
-    project = create_dbt_project_context(settings)
-
-    # Use provided dialect or get from adapter
-    sql_dialect = dialect or project.adapter.type()
-
-    # Prepare rules list
-    enabled_rules, disabled_rules = _rule_options(rules, disable_rules)
 
     # Lint the SQL
     result = lint_sql_code(
@@ -2493,24 +2484,16 @@ def lint_model_command(
     This command analyzes a dbt model's SQL for style issues, anti-patterns, and potential bugs.
     """
     logger.info(":water_wave: Executing dbt-osmosis SQL linting\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
+    project, sql_dialect, enabled_rules, disabled_rules = _sql_lint_inputs(
+        project_dir,
+        profiles_dir,
+        target,
+        dialect,
+        rules,
+        disable_rules,
         **kwargs,
     )
-    project = create_dbt_project_context(settings)
-
-    # Use provided dialect or get from adapter
-    sql_dialect = dialect or project.adapter.type()
-
-    # Create linter
-    enabled_rules, disabled_rules = _rule_options(rules, disable_rules)
-    linter = SQLLinter(
-        dialect=sql_dialect,
-        enabled_rules=enabled_rules,
-        disabled_rules=disabled_rules,
-    )
+    linter = _sql_linter(sql_dialect, enabled_rules, disabled_rules)
 
     # Lint the model
     result = linter.lint_model(project, model_name)
@@ -2571,24 +2554,16 @@ def lint_project_command(
     This command analyzes all dbt models' SQL for style issues, anti-patterns, and potential bugs.
     """
     logger.info(":water_wave: Executing dbt-osmosis SQL linting\n")
-    settings = DbtConfiguration(
-        project_dir=t.cast(str, project_dir),
-        profiles_dir=t.cast(str, profiles_dir),
-        target=target,
+    project, sql_dialect, enabled_rules, disabled_rules = _sql_lint_inputs(
+        project_dir,
+        profiles_dir,
+        target,
+        dialect,
+        rules,
+        disable_rules,
         **kwargs,
     )
-    project = create_dbt_project_context(settings)
-
-    # Use provided dialect or get from adapter
-    sql_dialect = dialect or project.adapter.type()
-
-    # Create linter
-    enabled_rules, disabled_rules = _rule_options(rules, disable_rules)
-    linter = SQLLinter(
-        dialect=sql_dialect,
-        enabled_rules=enabled_rules,
-        disabled_rules=disabled_rules,
-    )
+    linter = _sql_linter(sql_dialect, enabled_rules, disabled_rules)
 
     # Lint the project
     fqn_filter = list(fqn) if fqn else None

@@ -8,6 +8,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("fresh_caches")
 import ruamel.yaml
 from dbt.artifacts.resources.types import NodeType
 
@@ -28,7 +30,7 @@ from dbt_osmosis.core.sync_operations import (
 )
 
 
-def test_sync_node_to_yaml(yaml_context: YamlRefactorContext, fresh_caches):
+def test_sync_node_to_yaml(yaml_context: YamlRefactorContext):
     """For a single node, we can confirm that sync_node_to_yaml runs without error,
     using the real file or generating one if missing (in dry_run mode).
     """
@@ -211,7 +213,7 @@ def test_sync_doc_section_scaffold_empty_configs_falls_back_to_cli_setting() -> 
     assert sync_columns(cli_scaffold_empty_configs=True) == [{"name": "id", "description": ""}]
 
 
-def test_sync_node_to_yaml_versioned(yaml_context: YamlRefactorContext, fresh_caches):
+def test_sync_node_to_yaml_versioned(yaml_context: YamlRefactorContext):
     """Test syncing a versioned node to YAML."""
     node = yaml_context.project.manifest.nodes["model.jaffle_shop_duckdb.stg_customers.v2"]
     sync_node_to_yaml(yaml_context, node, commit=False)
@@ -249,7 +251,6 @@ def test_finalize_synced_document_dry_run_commit_false_discards_cache(tmp_path: 
 
 def test_sync_node_to_yaml_versioned_preserves_column_selector(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Versioned sync should preserve dbt include/exclude selector entries."""
     yaml_context.settings.dry_run = False
@@ -369,7 +370,6 @@ def test_all_node_sync_preflights_duplicates_before_any_write(
 
 def test_sync_node_to_yaml_all_versions_share_one_truthful_write(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Syncing all candidates must update every versioned entry in the shared YAML file.
 
@@ -516,7 +516,6 @@ def test_group_sync_nodes_serializes_sources_sharing_target_path(
 
 def test_sync_node_to_yaml_repeated_threads_same_target_preserves_model_sections(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -720,7 +719,7 @@ def test_get_or_create_source_rejects_non_list_tables_when_matching_by_table() -
     assert len(doc["sources"]) == 1
 
 
-def test_preserve_unrendered_descriptions(yaml_context: YamlRefactorContext, fresh_caches):
+def test_preserve_unrendered_descriptions(yaml_context: YamlRefactorContext):
     """Test that when use_unrendered_descriptions is True, descriptions containing
     doc blocks ({{ doc(...) }} or {% docs %}{% enddocs %}) are preserved instead
     of being replaced with the rendered version from the manifest.
@@ -775,7 +774,7 @@ def test_preserve_unrendered_descriptions(yaml_context: YamlRefactorContext, fre
         assert updated_status_col["description"] == original_description
 
 
-def test_prefer_yaml_values_preserves_var_jinja(yaml_context: YamlRefactorContext, fresh_caches):
+def test_prefer_yaml_values_preserves_var_jinja(yaml_context: YamlRefactorContext):
     """Test that when prefer_yaml_values is True, fields containing {{ var() }}
     jinja templates are preserved instead of being replaced with rendered values.
 
@@ -833,7 +832,6 @@ def test_prefer_yaml_values_preserves_var_jinja(yaml_context: YamlRefactorContex
 
 def test_prefer_yaml_values_preserves_env_var_jinja(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Test that when prefer_yaml_values is True, fields containing {{ env_var() }}
     jinja templates are preserved.
@@ -888,9 +886,35 @@ def test_prefer_yaml_values_preserves_env_var_jinja(
         )
 
 
+def _column_named(columns: list, column_name: str) -> dict:
+    column = next((column for column in columns if column.get("name") == column_name), None)
+    assert column is not None, f"Column {column_name} not found"
+    return column
+
+
+def _assert_jinja_field_preserved(column: dict, field_key: str, expected_value: object) -> None:
+    assert field_key in column, f"Field {field_key} not in column {column.get('name')}"
+
+    updated_value = column[field_key]
+    if isinstance(expected_value, list):
+        assert any("{{ var(" in str(value) for value in updated_value), (
+            f"Expected {{ var() }} to be preserved in {column.get('name')}.{field_key}"
+        )
+        return
+
+    if isinstance(expected_value, dict):
+        assert any("{{ env_var(" in str(value) for value in updated_value.values()), (
+            f"Expected {{ env_var() }} to be preserved in {column.get('name')}.{field_key}"
+        )
+        return
+
+    assert "{% docs " in updated_value, (
+        f"Expected {{% docs %}} to be preserved in {column.get('name')}.{field_key}"
+    )
+
+
 def test_prefer_yaml_values_preserves_all_jinja_patterns(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Test that prefer_yaml_values preserves all types of jinja templates including:
     - {{ doc() }}
@@ -940,31 +964,15 @@ def test_prefer_yaml_values_preserves_all_jinja_patterns(
         # Verify all jinja patterns were preserved
         updated_columns = updated_yaml.get("columns", [])
         for col_name, field_key, field_value in test_cases:
-            col = next((c for c in updated_columns if c.get("name") == col_name), None)
-            assert col is not None, f"Column {col_name} not found"
-            assert field_key in col, f"Field {field_key} not in column {col_name}"
-
-            # Check that jinja patterns are preserved
-            if isinstance(field_value, list):
-                updated_value = col[field_key]
-                assert any("{{ var(" in str(v) for v in updated_value), (
-                    f"Expected {{ var() }} to be preserved in {col_name}.{field_key}"
-                )
-            elif isinstance(field_value, dict):
-                updated_value = col[field_key]
-                assert any("{{ env_var(" in str(v) for v in updated_value.values()), (
-                    f"Expected {{ env_var() }} to be preserved in {col_name}.{field_key}"
-                )
-            else:
-                updated_value = col[field_key]
-                assert "{% docs " in updated_value, (
-                    f"Expected {{% docs %}} to be preserved in {col_name}.{field_key}"
-                )
+            _assert_jinja_field_preserved(
+                _column_named(updated_columns, col_name),
+                field_key,
+                field_value,
+            )
 
 
 def test_add_inheritance_for_specified_keys_still_works(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Test that --add-inheritance-for-specified-keys still works for granular control.
     This ensures backward compatibility with existing functionality.
@@ -1069,7 +1077,6 @@ def test_sync_doc_section_existing_empty_columns_removed():
 
 def test_fusion_compat_pushes_meta_into_config(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Test that when fusion_compat=True, top-level meta/tags are pushed into config block."""
     node = yaml_context.project.manifest.nodes["model.jaffle_shop_duckdb.orders"]
@@ -1109,7 +1116,6 @@ def test_fusion_compat_pushes_meta_into_config(
 
 def test_classic_mode_strips_config(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
 ):
     """Test that when fusion_compat=False, config block is stripped and meta/tags stay top-level."""
     node = yaml_context.project.manifest.nodes["model.jaffle_shop_duckdb.orders"]

@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("fresh_caches")
+
 from dbt_osmosis.core.settings import YamlRefactorContext
 from dbt_osmosis.core.transforms import (
     TransformPipeline,
@@ -39,7 +41,7 @@ def test_transform_pipeline_rejects_unsupported_rshift_operand():
         pipeline >> object()
 
 
-def test_full_pipeline_execution(yaml_context: YamlRefactorContext, fresh_caches):
+def test_full_pipeline_execution(yaml_context: YamlRefactorContext):
     """Test that the full transform pipeline executes correctly.
 
     This creates a realistic pipeline with multiple transforms chained together
@@ -68,7 +70,7 @@ def test_full_pipeline_execution(yaml_context: YamlRefactorContext, fresh_caches
     assert len(target_node.columns) >= initial_column_count
 
 
-def test_pipeline_with_inject_and_inherit(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_with_inject_and_inherit(yaml_context: YamlRefactorContext):
     """Test pipeline that injects missing columns then inherits knowledge.
 
     This is a common pattern:
@@ -92,7 +94,7 @@ def test_pipeline_with_inject_and_inherit(yaml_context: YamlRefactorContext, fre
     assert len(pipeline.metadata["steps"]) == 2
 
 
-def test_pipeline_with_remove_and_sort(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_with_remove_and_sort(yaml_context: YamlRefactorContext):
     """Test pipeline that removes stale columns then sorts.
 
     This tests that:
@@ -121,7 +123,7 @@ def test_pipeline_with_remove_and_sort(yaml_context: YamlRefactorContext, fresh_
     assert len(columns_after) <= len(columns_before)
 
 
-def test_pipeline_transform_ordering(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_transform_ordering(yaml_context: YamlRefactorContext):
     """Test that transforms execute in the correct order when chained.
 
     Pipeline: inject >> inherit
@@ -146,7 +148,7 @@ def test_pipeline_transform_ordering(yaml_context: YamlRefactorContext, fresh_ca
     assert target_node.columns["first_name"].description == "From staging"
 
 
-def test_pipeline_state_consistency(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_state_consistency(yaml_context: YamlRefactorContext):
     """Test that the context state remains consistent across pipeline execution.
 
     The yaml_context should be mutated in-place by the pipeline.
@@ -165,7 +167,7 @@ def test_pipeline_state_consistency(yaml_context: YamlRefactorContext, fresh_cac
     assert yaml_context.mutation_count >= initial_count
 
 
-def test_empty_pipeline(yaml_context: YamlRefactorContext, fresh_caches):
+def test_empty_pipeline(yaml_context: YamlRefactorContext):
     """Test that an empty pipeline (single transform) works correctly.
 
     This verifies the >> operator works with just one transform.
@@ -178,7 +180,7 @@ def test_empty_pipeline(yaml_context: YamlRefactorContext, fresh_caches):
     assert result == pipeline
 
 
-def test_pipeline_with_settings(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_with_settings(yaml_context: YamlRefactorContext):
     """Test that pipeline respects context settings.
 
     Settings like force_inherit_descriptions, skip_add_tags, etc.
@@ -197,7 +199,7 @@ def test_pipeline_with_settings(yaml_context: YamlRefactorContext, fresh_caches)
     assert pipeline.metadata.get("success", True)
 
 
-def test_pipeline_multiple_targets(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_multiple_targets(yaml_context: YamlRefactorContext):
     """Test running the same pipeline on multiple target nodes.
 
     This simulates the real-world usage where a pipeline is executed
@@ -214,7 +216,7 @@ def test_pipeline_multiple_targets(yaml_context: YamlRefactorContext, fresh_cach
     assert result is pipeline
 
 
-def test_pipeline_idempotency(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_idempotency(yaml_context: YamlRefactorContext):
     """Test that running the same pipeline twice produces consistent results.
 
     A pipeline should be idempotent - running it multiple times should
@@ -232,7 +234,7 @@ def test_pipeline_idempotency(yaml_context: YamlRefactorContext, fresh_caches):
     assert result2 is pipeline
 
 
-def test_pipeline_with_catalog(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_with_catalog(yaml_context: YamlRefactorContext):
     """Test that pipeline uses catalog when available instead of live introspection.
 
     When catalog.json exists, transforms should use it for column metadata
@@ -249,7 +251,7 @@ def test_pipeline_with_catalog(yaml_context: YamlRefactorContext, fresh_caches):
     assert result is pipeline
 
 
-def test_pipeline_error_handling(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_error_handling(yaml_context: YamlRefactorContext):
     """Test that pipeline handles errors gracefully.
 
     If one transform fails, it should not leave the context in an
@@ -265,7 +267,7 @@ def test_pipeline_error_handling(yaml_context: YamlRefactorContext, fresh_caches
     assert result is pipeline
 
 
-def test_pipeline_with_database_sort(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_with_database_sort(yaml_context: YamlRefactorContext):
     """Test pipeline with database column ordering.
 
     The sort_columns_as_in_database transform should order columns
@@ -289,7 +291,7 @@ def test_pipeline_with_database_sort(yaml_context: YamlRefactorContext, fresh_ca
     assert len(target_node.columns) > 0
 
 
-def test_pipeline_with_alphabetical_sort(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_with_alphabetical_sort(yaml_context: YamlRefactorContext):
     """Test pipeline with alphabetical column ordering.
 
     The sort_columns_alphabetically transform should order columns
@@ -310,7 +312,7 @@ def test_pipeline_with_alphabetical_sort(yaml_context: YamlRefactorContext, fres
     assert column_names == sorted(column_names)
 
 
-def test_pipeline_metadata_tracking(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_metadata_tracking(yaml_context: YamlRefactorContext):
     """Test that pipeline correctly tracks execution metadata.
 
     The pipeline should track which operations were executed and their success.
@@ -328,7 +330,7 @@ def test_pipeline_metadata_tracking(yaml_context: YamlRefactorContext, fresh_cac
         assert step.get("success", True)
 
 
-def test_three_transform_pipeline(yaml_context: YamlRefactorContext, fresh_caches):
+def test_three_transform_pipeline(yaml_context: YamlRefactorContext):
     """Test a longer pipeline with three transforms chained together.
 
     This verifies that the >> operator works correctly for multiple transforms.
@@ -350,7 +352,7 @@ def test_three_transform_pipeline(yaml_context: YamlRefactorContext, fresh_cache
     assert column_names == sorted(column_names)
 
 
-def test_pipeline_commit_mode(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_commit_mode(yaml_context: YamlRefactorContext):
     """Test that pipeline commit modes work correctly.
 
     The commit_mode affects when changes are committed to YAML files.
@@ -364,7 +366,7 @@ def test_pipeline_commit_mode(yaml_context: YamlRefactorContext, fresh_caches):
     assert result is pipeline
 
 
-def test_pipeline_with_specific_node(yaml_context: YamlRefactorContext, fresh_caches):
+def test_pipeline_with_specific_node(yaml_context: YamlRefactorContext):
     """Test running a pipeline on a specific node instead of all nodes.
 
     This tests that the node parameter is properly passed through the pipeline.

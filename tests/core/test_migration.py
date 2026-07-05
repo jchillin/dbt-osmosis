@@ -2,6 +2,8 @@
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("fresh_caches")
+
 from dbt_osmosis.core.diff import (
     ChangeCategory,
     ChangeSeverity,
@@ -18,7 +20,7 @@ from dbt_osmosis.core.migration import (
 from dbt_osmosis.core.settings import YamlRefactorContext
 
 
-def test_migration_planner_initialization(yaml_context: YamlRefactorContext, fresh_caches):
+def test_migration_planner_initialization(yaml_context: YamlRefactorContext):
     """Test that MigrationPlanner can be initialized with a context."""
     planner = MigrationPlanner(yaml_context)
     assert planner._context == yaml_context
@@ -26,13 +28,13 @@ def test_migration_planner_initialization(yaml_context: YamlRefactorContext, fre
     assert planner._format == MigrationFormat.SQL
 
 
-def test_migration_planner_dry_run(yaml_context: YamlRefactorContext, fresh_caches):
+def test_migration_planner_dry_run(yaml_context: YamlRefactorContext):
     """Test that MigrationPlanner accepts dry_run flag."""
     planner = MigrationPlanner(yaml_context, dry_run=True)
     assert planner._dry_run is True
 
 
-def test_migration_planner_format(yaml_context: YamlRefactorContext, fresh_caches):
+def test_migration_planner_format(yaml_context: YamlRefactorContext):
     """Test that MigrationPlanner accepts different formats."""
     planner = MigrationPlanner(yaml_context, format=MigrationFormat.JSON)
     assert planner._format == MigrationFormat.JSON
@@ -274,7 +276,7 @@ def test_migration_plan_to_dict(yaml_context: YamlRefactorContext):
     assert data["steps"][0]["is_breaking"] is False
 
 
-def test_migration_planner_dialect_detection(yaml_context: YamlRefactorContext, fresh_caches):
+def test_migration_planner_dialect_detection(yaml_context: YamlRefactorContext):
     """Test that MigrationPlanner detects the correct dialect."""
     planner = MigrationPlanner(yaml_context)
 
@@ -282,7 +284,7 @@ def test_migration_planner_dialect_detection(yaml_context: YamlRefactorContext, 
     assert planner._dialect in ("duckdb", "postgres")
 
 
-def test_migration_planner_quote_identifier(yaml_context: YamlRefactorContext, fresh_caches):
+def test_migration_planner_quote_identifier(yaml_context: YamlRefactorContext):
     """Test identifier quoting for different SQL dialects."""
     # Test DuckDB (double quotes)
     planner = MigrationPlanner(yaml_context)
@@ -295,7 +297,7 @@ def test_migration_planner_quote_identifier(yaml_context: YamlRefactorContext, f
         assert '"my_table"' == quoted
 
 
-def test_migration_planner_plan_for_result_empty(yaml_context: YamlRefactorContext, fresh_caches):
+def test_migration_planner_plan_for_result_empty(yaml_context: YamlRefactorContext):
     """Test planning a result with no changes."""
     planner = MigrationPlanner(yaml_context)
 
@@ -322,9 +324,7 @@ def test_migration_planner_plan_for_result_empty(yaml_context: YamlRefactorConte
     assert len(plan.steps) == 0
 
 
-def test_migration_planner_plan_for_result_with_changes(
-    yaml_context: YamlRefactorContext, fresh_caches
-):
+def test_migration_planner_plan_for_result_with_changes(yaml_context: YamlRefactorContext):
     """Test planning a result with changes."""
     planner = MigrationPlanner(yaml_context)
 
@@ -361,7 +361,7 @@ def test_migration_planner_plan_for_result_with_changes(
     assert "ALTER TABLE" in plan.steps[0].sql
 
 
-def test_migration_planner_plan_for_results(yaml_context: YamlRefactorContext, fresh_caches):
+def test_migration_planner_plan_for_results(yaml_context: YamlRefactorContext):
     """Test planning multiple results."""
     planner = MigrationPlanner(yaml_context)
 

@@ -3,6 +3,8 @@ import typing as t
 
 import dbt.version
 import pytest
+
+pytestmark = pytest.mark.usefixtures("fresh_caches")
 from packaging.version import Version
 
 from dbt_osmosis.core.inheritance import _build_node_ancestor_tree, _get_node_yaml
@@ -197,7 +199,6 @@ def test_build_node_ancestor_tree(
 )
 def test_inherit_upstream_column_knowledge_with_various_settings(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
     settings: dict[str, t.Any],
     upstream_mutations: dict[str, t.Any],
     downstream_metadata: dict[str, t.Any],
@@ -259,7 +260,6 @@ def test_inherit_upstream_column_knowledge_with_various_settings(
 )
 def test_use_unrendered_descriptions(
     yaml_context: YamlRefactorContext,
-    fresh_caches,
     use_unrendered_descriptions: bool,
     expected_start: str,
 ):
@@ -275,7 +275,7 @@ def test_use_unrendered_descriptions(
     assert target_node.columns["status"].description.startswith(expected_start)
 
 
-def test_inherit_upstream_column_knowledge(yaml_context: YamlRefactorContext, fresh_caches):
+def test_inherit_upstream_column_knowledge(yaml_context: YamlRefactorContext):
     manifest = yaml_context.project.manifest
     manifest.nodes["model.jaffle_shop_duckdb.stg_customers.v1"].columns[
         "customer_id"

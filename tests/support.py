@@ -62,6 +62,41 @@ def _is_generated_fixture_artifact(relative_path: Path) -> bool:
     return name.endswith(_LOCAL_ARTIFACT_SUFFIXES)
 
 
+def _iter_duckdb_profile_outputs(profile_data: dict):
+    for profile_config in profile_data.values():
+        if not isinstance(profile_config, dict):
+            continue
+
+        outputs = profile_config.get("outputs")
+        if not isinstance(outputs, dict):
+            continue
+
+        for output_config in outputs.values():
+            if isinstance(output_config, dict) and output_config.get("type") == "duckdb":
+                yield output_config
+
+
+def _rewrite_duckdb_output_path(output_config: dict, project_dir: Path) -> bool:
+    if "path" not in output_config:
+        return False
+
+    configured_path = str(output_config["path"])
+    if configured_path.startswith(":"):
+        return False
+
+    database_path = Path(configured_path)
+    rewritten_path = (
+        project_dir / database_path.name
+        if database_path.is_absolute()
+        else project_dir / database_path
+    ).resolve()
+    if configured_path == str(rewritten_path):
+        return False
+
+    output_config["path"] = str(rewritten_path)
+    return True
+
+
 def rewrite_duckdb_profile_paths(project_dir: Path) -> None:
     """Rewrite DuckDB profile paths to absolute paths inside ``project_dir``."""
     profiles_path = project_dir / "profiles.yml"
@@ -74,30 +109,8 @@ def rewrite_duckdb_profile_paths(project_dir: Path) -> None:
         return
 
     changed = False
-    for profile_config in profile_data.values():
-        if not isinstance(profile_config, dict):
-            continue
-        outputs = profile_config.get("outputs")
-        if not isinstance(outputs, dict):
-            continue
-        for output_config in outputs.values():
-            if not isinstance(output_config, dict):
-                continue
-            if output_config.get("type") != "duckdb" or "path" not in output_config:
-                continue
-
-            configured_path = str(output_config["path"])
-            if configured_path.startswith(":"):
-                continue
-            database_path = Path(configured_path)
-            rewritten_path = (
-                project_dir / database_path.name
-                if database_path.is_absolute()
-                else project_dir / database_path
-            ).resolve()
-            if configured_path != str(rewritten_path):
-                output_config["path"] = str(rewritten_path)
-                changed = True
+    for output_config in _iter_duckdb_profile_outputs(profile_data):
+        changed = _rewrite_duckdb_output_path(output_config, project_dir) or changed
 
     if changed:
         with profiles_path.open("w") as f:

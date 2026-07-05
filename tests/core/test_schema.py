@@ -5,6 +5,8 @@ from pathlib import Path
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("fresh_caches")
+
 from dbt_osmosis.core.schema.parser import create_yaml_instance
 from dbt_osmosis.core.schema.reader import (
     _YAML_BUFFER_CACHE,
@@ -821,7 +823,7 @@ def _clear_cache(cache, key):
         del cache[key]
 
 
-def test_fresh_caches_preserves_production_cache_instances(fresh_caches):
+def test_fresh_caches_preserves_production_cache_instances():
     """The central cache fixture must clear production cache objects, not replace them."""
     from dbt_osmosis.core import introspection
     from dbt_osmosis.core.schema import reader

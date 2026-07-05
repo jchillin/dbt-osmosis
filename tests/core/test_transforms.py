@@ -5,6 +5,8 @@ from unittest import mock
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("fresh_caches")
+
 from dbt_osmosis.core.settings import YamlRefactorContext
 from dbt_osmosis.core.transforms import (
     apply_semantic_analysis,
@@ -18,12 +20,12 @@ from dbt_osmosis.core.transforms import (
 )
 
 
-def test_inherit_upstream_column_knowledge(yaml_context: YamlRefactorContext, fresh_caches):
+def test_inherit_upstream_column_knowledge(yaml_context: YamlRefactorContext):
     """Minimal test that runs the inheritance logic on all matched nodes in the real project."""
     inherit_upstream_column_knowledge(yaml_context)
 
 
-def test_inject_missing_columns(yaml_context: YamlRefactorContext, fresh_caches):
+def test_inject_missing_columns(yaml_context: YamlRefactorContext):
     """If the DB has columns the YAML/manifest doesn't, we inject them.
     We run on all matched nodes to ensure no errors.
     """
@@ -32,7 +34,6 @@ def test_inject_missing_columns(yaml_context: YamlRefactorContext, fresh_caches)
 
 def test_inject_missing_columns_honors_supplementary_file_skip(
     tmp_path,
-    fresh_caches,
 ):
     """Supplementary dbt-osmosis.yml should affect the real inject transform."""
     (tmp_path / "dbt-osmosis.yml").write_text("skip-add-columns: true\n")
@@ -72,7 +73,6 @@ def test_inject_missing_columns_honors_supplementary_file_skip(
 
 def test_inject_missing_columns_all_nodes_allows_node_false_override(
     tmp_path,
-    fresh_caches,
 ):
     """Project-level skip should not bypass higher-precedence node false overrides."""
     (tmp_path / "dbt-osmosis.yml").write_text("skip-add-columns: true\n")
@@ -117,14 +117,14 @@ def test_inject_missing_columns_all_nodes_allows_node_false_override(
     assert list(mock_node.columns) == ["new_col"]
 
 
-def test_remove_columns_not_in_database(yaml_context: YamlRefactorContext, fresh_caches):
+def test_remove_columns_not_in_database(yaml_context: YamlRefactorContext):
     """If the manifest has columns the DB does not, we remove them.
     Typically, your real project might not have any extra columns, so this is a sanity test.
     """
     remove_columns_not_in_database(yaml_context)
 
 
-def test_sort_columns_as_in_database(yaml_context: YamlRefactorContext, fresh_caches):
+def test_sort_columns_as_in_database(yaml_context: YamlRefactorContext):
     """Sort columns in the order the DB sees them.
     With duckdb, this is minimal but we can still ensure no errors.
     """
@@ -151,7 +151,6 @@ def test_sort_columns_as_in_database(yaml_context: YamlRefactorContext, fresh_ca
     ],
 )
 def test_sort_columns_as_in_database_honors_output_case_settings(
-    fresh_caches,
     output_to_lower: bool,
     output_to_upper: bool,
     yaml_columns: list[str],
@@ -184,7 +183,7 @@ def test_sort_columns_as_in_database_honors_output_case_settings(
         mock.patch("dbt_osmosis.core.introspection.get_columns", return_value=incoming),
         mock.patch(
             "dbt_osmosis.core.introspection.resolve_setting",
-            side_effect=lambda *args, fallback=None, **kw: fallback,
+            side_effect=lambda *args, fallback=None, **_kw: fallback,
         ),
     ):
         sort_columns_as_in_database(context, mock_node)
@@ -192,24 +191,22 @@ def test_sort_columns_as_in_database_honors_output_case_settings(
     assert list(mock_node.columns) == expected_order
 
 
-def test_sort_columns_alphabetically(yaml_context: YamlRefactorContext, fresh_caches):
+def test_sort_columns_alphabetically(yaml_context: YamlRefactorContext):
     """Check that sort_columns_alphabetically doesn't blow up in real project usage."""
     sort_columns_alphabetically(yaml_context)
 
 
-def test_sort_columns_as_configured(yaml_context: YamlRefactorContext, fresh_caches):
+def test_sort_columns_as_configured(yaml_context: YamlRefactorContext):
     """By default, the sort_by is 'database', but let's confirm it doesn't blow up."""
     sort_columns_as_configured(yaml_context)
 
 
-def test_synchronize_data_types(yaml_context: YamlRefactorContext, fresh_caches):
+def test_synchronize_data_types(yaml_context: YamlRefactorContext):
     """Synchronizes data types with the DB."""
     synchronize_data_types(yaml_context)
 
 
-def test_sort_columns_alphabetically_with_output_to_lower(
-    yaml_context: YamlRefactorContext, fresh_caches
-):
+def test_sort_columns_alphabetically_with_output_to_lower(yaml_context: YamlRefactorContext):
     """Test that alphabetical sorting respects output-to-lower setting.
 
     When output-to-lower is enabled, columns should be sorted based on their
@@ -247,9 +244,7 @@ def test_sort_columns_alphabetically_with_output_to_lower(
     )
 
 
-def test_sort_columns_alphabetically_with_output_to_upper(
-    yaml_context: YamlRefactorContext, fresh_caches
-):
+def test_sort_columns_alphabetically_with_output_to_upper(yaml_context: YamlRefactorContext):
     """Test that alphabetical sorting respects output-to-upper setting.
 
     When output-to-upper is enabled, columns should be sorted based on their
@@ -279,9 +274,7 @@ def test_sort_columns_alphabetically_with_output_to_upper(
     )
 
 
-def test_sort_columns_alphabetically_without_case_conversion(
-    yaml_context: YamlRefactorContext, fresh_caches
-):
+def test_sort_columns_alphabetically_without_case_conversion(yaml_context: YamlRefactorContext):
     """Test that alphabetical sorting works correctly when no case conversion is enabled.
 
     When neither output-to-lower nor output-to-upper is set, columns should be
@@ -312,7 +305,7 @@ def test_sort_columns_alphabetically_without_case_conversion(
     )
 
 
-def test_inject_missing_columns_idempotent_with_output_to_upper_on_postgres(fresh_caches):
+def test_inject_missing_columns_idempotent_with_output_to_upper_on_postgres():
     """Test that inject_missing_columns is idempotent on non-Snowflake DBs with output-to-upper.
 
     Scenario (PostgreSQL + output-to-upper):
@@ -354,7 +347,7 @@ def test_inject_missing_columns_idempotent_with_output_to_upper_on_postgres(fres
         ),
         mock.patch(
             "dbt_osmosis.core.introspection.resolve_setting",
-            side_effect=lambda *args, fallback=None, **kw: fallback,
+            side_effect=lambda *args, fallback=None, **_kw: fallback,
         ),
     ):
         inject_missing_columns(context, mock_node)
@@ -365,7 +358,7 @@ def test_inject_missing_columns_idempotent_with_output_to_upper_on_postgres(fres
 
 
 @pytest.mark.parametrize("fusion_compat", [False, True])
-def test_inject_missing_columns_preserves_column_config_for_sync(fresh_caches, fusion_compat: bool):
+def test_inject_missing_columns_preserves_column_config_for_sync(fusion_compat: bool):
     """Injected ColumnInfo objects must keep dbt's config field and sync without empty config."""
     from collections import OrderedDict
 
@@ -406,7 +399,7 @@ def test_inject_missing_columns_preserves_column_config_for_sync(fresh_caches, f
         ),
         mock.patch(
             "dbt_osmosis.core.introspection.resolve_setting",
-            side_effect=lambda *args, fallback=None, **kw: fallback,
+            side_effect=lambda *args, fallback=None, **_kw: fallback,
         ),
     ):
         inject_missing_columns(context, mock_node)
@@ -421,7 +414,7 @@ def test_inject_missing_columns_preserves_column_config_for_sync(fresh_caches, f
     assert "config" not in doc_section["columns"][0]
 
 
-def test_remove_columns_not_in_database_with_output_to_upper_on_postgres(fresh_caches):
+def test_remove_columns_not_in_database_with_output_to_upper_on_postgres():
     """Test that remove_columns_not_in_database doesn't incorrectly remove columns
     when output-to-upper is active on a non-Snowflake DB.
 
@@ -464,7 +457,7 @@ def test_remove_columns_not_in_database_with_output_to_upper_on_postgres(fresh_c
         ),
         mock.patch(
             "dbt_osmosis.core.introspection.resolve_setting",
-            side_effect=lambda *args, fallback=None, **kw: fallback,
+            side_effect=lambda *args, fallback=None, **_kw: fallback,
         ),
     ):
         remove_columns_not_in_database(context, mock_node)
@@ -473,7 +466,7 @@ def test_remove_columns_not_in_database_with_output_to_upper_on_postgres(fresh_c
     assert set(mock_node.columns.keys()) == {"ZEBRA", "APPLE"}
 
 
-def test_remove_columns_not_in_database_removes_truly_extra_columns(fresh_caches):
+def test_remove_columns_not_in_database_removes_truly_extra_columns():
     """Test that truly extra columns are still removed even with case conversion."""
     from collections import OrderedDict
 
@@ -505,7 +498,7 @@ def test_remove_columns_not_in_database_removes_truly_extra_columns(fresh_caches
         ),
         mock.patch(
             "dbt_osmosis.core.introspection.resolve_setting",
-            side_effect=lambda *args, fallback=None, **kw: fallback,
+            side_effect=lambda *args, fallback=None, **_kw: fallback,
         ),
     ):
         remove_columns_not_in_database(context, mock_node)
@@ -514,7 +507,7 @@ def test_remove_columns_not_in_database_removes_truly_extra_columns(fresh_caches
     assert list(mock_node.columns.keys()) == ["ZEBRA"]
 
 
-def test_synchronize_data_types_with_output_to_upper_on_postgres(fresh_caches):
+def test_synchronize_data_types_with_output_to_upper_on_postgres():
     """Test that synchronize_data_types matches columns correctly when output-to-upper
     is active on a non-Snowflake DB.
 
@@ -552,7 +545,7 @@ def test_synchronize_data_types_with_output_to_upper_on_postgres(fresh_caches):
         ),
         mock.patch(
             "dbt_osmosis.core.introspection.resolve_setting",
-            side_effect=lambda *args, fallback=None, **kw: fallback,
+            side_effect=lambda *args, fallback=None, **_kw: fallback,
         ),
     ):
         synchronize_data_types(context, mock_node)
@@ -561,7 +554,7 @@ def test_synchronize_data_types_with_output_to_upper_on_postgres(fresh_caches):
     assert mock_node.columns["ZEBRA"].data_type == "VARCHAR"
 
 
-def test_inject_missing_columns_applies_output_to_lower(fresh_caches):
+def test_inject_missing_columns_applies_output_to_lower():
     """Test that inject_missing_columns converts new column keys to lowercase
     when output-to-lower is enabled.
 
@@ -608,7 +601,7 @@ def test_inject_missing_columns_applies_output_to_lower(fresh_caches):
         ),
         mock.patch(
             "dbt_osmosis.core.introspection.resolve_setting",
-            side_effect=lambda *args, fallback=None, **kw: fallback,
+            side_effect=lambda *args, fallback=None, **_kw: fallback,
         ),
     ):
         inject_missing_columns(context, mock_node)
@@ -621,7 +614,7 @@ def test_inject_missing_columns_applies_output_to_lower(fresh_caches):
     assert set(column_keys) == {"zebra", "apple", "banana"}
 
 
-def test_inject_missing_columns_with_lower_then_sort_alphabetically(fresh_caches):
+def test_inject_missing_columns_with_lower_then_sort_alphabetically():
     """End-to-end test: inject with output-to-lower followed by alphabetical sort
     should produce correctly ordered lowercase keys on the first run.
     """
@@ -658,7 +651,7 @@ def test_inject_missing_columns_with_lower_then_sort_alphabetically(fresh_caches
         ),
         mock.patch(
             "dbt_osmosis.core.introspection.resolve_setting",
-            side_effect=lambda *args, fallback=None, **kw: fallback,
+            side_effect=lambda *args, fallback=None, **_kw: fallback,
         ),
     ):
         inject_missing_columns(context, mock_node)
@@ -675,7 +668,7 @@ def test_inject_missing_columns_with_lower_then_sort_alphabetically(fresh_caches
 def test_apply_semantic_analysis_accumulates_description_tags_and_meta(monkeypatch):
     from dbt.contracts.graph.nodes import ColumnInfo
 
-    def fake_analyze_column_semantics(**kwargs):
+    def fake_analyze_column_semantics(**_kwargs):
         return {
             "semantic_type": "identifier",
             "tags": ["existing_tag", "primary_key"],
@@ -685,7 +678,7 @@ def test_apply_semantic_analysis_accumulates_description_tags_and_meta(monkeypat
             },
         }
 
-    def fake_generate_semantic_description(**kwargs):
+    def fake_generate_semantic_description(**_kwargs):
         return "Generated customer identifier."
 
     monkeypatch.setitem(fake_analyze_column_semantics.__globals__, "get_llm_client", object)
@@ -729,12 +722,12 @@ def test_apply_semantic_analysis_accumulates_description_tags_and_meta(monkeypat
 def test_apply_semantic_analysis_continues_after_column_failure(monkeypatch):
     from dbt.contracts.graph.nodes import ColumnInfo
 
-    def fake_analyze_column_semantics(**kwargs):
-        if kwargs["column_name"] == "bad_column":
+    def fake_analyze_column_semantics(**_kwargs):
+        if _kwargs["column_name"] == "bad_column":
             raise RuntimeError("analysis failed")
         return {"semantic_type": "dimension"}
 
-    def fake_generate_semantic_description(**kwargs):
+    def fake_generate_semantic_description(**_kwargs):
         return "Generated description."
 
     monkeypatch.setitem(fake_analyze_column_semantics.__globals__, "get_llm_client", object)

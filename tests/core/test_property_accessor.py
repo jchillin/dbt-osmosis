@@ -18,6 +18,8 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+pytestmark = pytest.mark.usefixtures("fresh_caches")
+
 # Import will work once PropertyAccessor is implemented
 from dbt_osmosis.core.introspection import PropertyAccessor
 
@@ -216,7 +218,6 @@ class TestPropertyAccessor:
         self,
         mock_get_yaml,
         sample_node_with_unrendered: MockNode,
-        sample_yaml_file: Path,
         mock_context: Mock,
     ) -> None:
         """Test getting a property from YAML (unrendered)."""
@@ -241,7 +242,6 @@ class TestPropertyAccessor:
         self,
         mock_get_yaml,
         sample_node_rendered: MockNode,
-        sample_yaml_file: Path,
         mock_context: Mock,
     ) -> None:
         """Test that source='auto' with unrendered jinja prefers YAML."""
@@ -258,7 +258,6 @@ class TestPropertyAccessor:
     def test_prefer_unrendered_false(
         self,
         sample_node_rendered: MockNode,
-        sample_yaml_file: Path,
         mock_context: Mock,
     ) -> None:
         """Test that source='manifest' always uses manifest."""
@@ -270,7 +269,6 @@ class TestPropertyAccessor:
     def test_get_column_property(
         self,
         sample_node_rendered: MockNode,
-        sample_yaml_file: Path,
         mock_context: Mock,
     ) -> None:
         """Test getting a column-level property."""
@@ -405,7 +403,6 @@ class TestPropertyAccessor:
     def test_yaml_source_reads_version_level_column_properties(
         self,
         yaml_context,
-        fresh_caches,
     ) -> None:
         """YAML source should read selected versions[].columns and top-level fallbacks."""
         from dbt_osmosis.core.schema.reader import _read_yaml
@@ -531,7 +528,6 @@ class TestPropertyAccessor:
         self,
         mock_get_yaml,
         sample_node_rendered: MockNode,
-        sample_yaml_file: Path,
         mock_context: Mock,
     ) -> None:
         """Test accessing a column that exists in manifest but not in YAML."""
@@ -562,7 +558,6 @@ class TestPropertyAccessor:
         self,
         mock_get_yaml,
         sample_node_with_unrendered: MockNode,
-        sample_yaml_file: Path,
         mock_context: Mock,
     ) -> None:
         """Test that unrendered jinja templates are preserved."""
@@ -632,13 +627,13 @@ class TestPropertyAccessorIntegration:
     """
 
     @pytest.mark.skip(reason="Demo project fixture not yet set up")
-    def test_access_with_demo_project(self, demo_project: Path) -> None:
+    def test_access_with_demo_project(self) -> None:
         """Test property accessor with the demo_duckdb project."""
 
     @pytest.mark.skip(reason="Demo project fixture not yet set up")
-    def test_source_definitions(self, demo_project: Path) -> None:
+    def test_source_definitions(self) -> None:
         """Test accessing properties from source definitions."""
 
     @pytest.mark.skip(reason="Demo project fixture not yet set up")
-    def test_seed_definitions(self, demo_project: Path) -> None:
+    def test_seed_definitions(self) -> None:
         """Test accessing properties from seed definitions."""

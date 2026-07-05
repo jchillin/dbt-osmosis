@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+
+pytestmark = pytest.mark.usefixtures("fresh_caches")
 from dbt.adapters.base.column import Column
 
 from dbt_osmosis.core.introspection import (
@@ -105,7 +107,7 @@ def test_get_columns_simple(yaml_context: YamlRefactorContext):
     assert "customer_id" in cols
 
 
-def test_get_columns_reprocesses_cached_columns_when_settings_change(fresh_caches):
+def test_get_columns_reprocesses_cached_columns_when_settings_change():
     """Changing dtype settings must not reuse stale processed column metadata."""
     relation = _FakeRelation("db.schema.orders")
     calls = []
@@ -125,7 +127,7 @@ def test_get_columns_reprocesses_cached_columns_when_settings_change(fresh_cache
     assert calls == [("dev", relation.render())]
 
 
-def test_get_columns_honors_context_project_vars_for_precise_dtype(fresh_caches):
+def test_get_columns_honors_context_project_vars_for_precise_dtype():
     """Project config should affect dtype precision during real column introspection."""
     relation = _FakeRelation("db.schema.orders")
     calls = []
@@ -141,7 +143,7 @@ def test_get_columns_honors_context_project_vars_for_precise_dtype(fresh_caches)
     assert calls == [("dev", relation.render())]
 
 
-def test_get_columns_scopes_cache_by_target(fresh_caches):
+def test_get_columns_scopes_cache_by_target():
     """Switching targets must not reuse warehouse metadata from another target."""
     relation = _FakeRelation("db.schema.orders")
     calls = []
@@ -160,7 +162,7 @@ def test_get_columns_scopes_cache_by_target(fresh_caches):
     assert calls == [("dev", relation.render()), ("prod", relation.render())]
 
 
-def test_get_columns_reprocesses_cached_columns_for_new_context_filters(fresh_caches):
+def test_get_columns_reprocesses_cached_columns_for_new_context_filters():
     """A new context must be able to apply different ignore patterns truthfully."""
     relation = _FakeRelation("db.schema.orders")
     calls = []
