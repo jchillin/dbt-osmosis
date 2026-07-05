@@ -470,60 +470,124 @@ class TestConfigValidator(Validator):
 
         version_column_selector_seen = False
         for idx, column in enumerate(columns):
-            if not isinstance(column, dict):
-                result.add_error(
-                    code="INVALID_COLUMN_TYPE",
-                    message=f"Column at index {idx} in {owner_kind} '{owner_name}' must be a dictionary",
-                    file_path=file_path,
-                    column_name=owner_name,
-                )
-                continue
+            version_column_selector_seen = self._validate_column_entry(
+                idx,
+                column,
+                result,
+                file_path,
+                owner_kind,
+                owner_name,
+                version_column_selector_seen,
+            )
 
-            # Check column name
-            name = column.get("name")
-            if (
-                owner_kind == "model version"
-                and name is None
-                and ("include" in column or "exclude" in column)
-            ):
-                if version_column_selector_seen:
-                    self._add_version_column_selector_error(
-                        result,
-                        file_path,
-                        owner_name,
-                        f"Model version '{owner_name}' can have at most one include/exclude column selector",
-                        "include",
-                        column.get("include"),
-                    )
-                version_column_selector_seen = True
-                self._validate_version_column_control(column, result, file_path, owner_name)
-                continue
-            if not name:
-                result.add_error(
-                    code="MISSING_COLUMN_NAME",
-                    message=f"Column at index {idx} in {owner_kind} '{owner_name}' is missing required 'name' field",
-                    file_path=file_path,
-                    column_name=owner_name,
-                )
-            elif not isinstance(name, str):
-                result.add_error(
-                    code="INVALID_COLUMN_NAME",
-                    message=f"Column name must be a string, got {type(name).__name__}",
-                    file_path=file_path,
-                    column_name=str(name),
-                )
+    def _validate_column_entry(
+        self,
+        idx: int,
+        column: t.Any,
+        result: ValidationResult,
+        file_path: Path | None,
+        owner_kind: str,
+        owner_name: str,
+        version_column_selector_seen: bool,
+    ) -> bool:
+        if not isinstance(column, dict):
+            result.add_error(
+                code="INVALID_COLUMN_TYPE",
+                message=f"Column at index {idx} in {owner_kind} '{owner_name}' must be a dictionary",
+                file_path=file_path,
+                column_name=owner_name,
+            )
+            return version_column_selector_seen
 
-            column_name = name if isinstance(name, str) else "<unknown>"
-            tests = column.get("data_tests", column.get("tests", []))
-            if tests:
-                self._validate_tests(
-                    tests,
-                    result,
-                    file_path,
-                    resource_kind=owner_kind,
-                    resource_name=owner_name,
-                    column_name=column_name,
-                )
+        name = column.get("name")
+        if self._is_version_column_selector(owner_kind, name, column):
+            self._validate_version_column_selector_entry(
+                column,
+                result,
+                file_path,
+                owner_name,
+                version_column_selector_seen,
+            )
+            return True
+
+        self._validate_column_name(name, idx, result, file_path, owner_kind, owner_name)
+        self._validate_column_tests(column, name, result, file_path, owner_kind, owner_name)
+        return version_column_selector_seen
+
+    def _is_version_column_selector(
+        self, owner_kind: str, name: t.Any, column: dict[str, t.Any]
+    ) -> bool:
+        return (
+            owner_kind == "model version"
+            and name is None
+            and ("include" in column or "exclude" in column)
+        )
+
+    def _validate_version_column_selector_entry(
+        self,
+        column: dict[str, t.Any],
+        result: ValidationResult,
+        file_path: Path | None,
+        owner_name: str,
+        version_column_selector_seen: bool,
+    ) -> None:
+        if version_column_selector_seen:
+            self._add_version_column_selector_error(
+                result,
+                file_path,
+                owner_name,
+                f"Model version '{owner_name}' can have at most one include/exclude column selector",
+                "include",
+                column.get("include"),
+            )
+        self._validate_version_column_control(column, result, file_path, owner_name)
+
+    def _validate_column_name(
+        self,
+        name: t.Any,
+        idx: int,
+        result: ValidationResult,
+        file_path: Path | None,
+        owner_kind: str,
+        owner_name: str,
+    ) -> None:
+        if not name:
+            result.add_error(
+                code="MISSING_COLUMN_NAME",
+                message=f"Column at index {idx} in {owner_kind} '{owner_name}' is missing required 'name' field",
+                file_path=file_path,
+                column_name=owner_name,
+            )
+        elif not isinstance(name, str):
+            result.add_error(
+                code="INVALID_COLUMN_NAME",
+                message=f"Column name must be a string, got {type(name).__name__}",
+                file_path=file_path,
+                column_name=str(name),
+            )
+
+    def _validate_column_tests(
+        self,
+        column: dict[str, t.Any],
+        name: t.Any,
+        result: ValidationResult,
+        file_path: Path | None,
+        owner_kind: str,
+        owner_name: str,
+    ) -> None:
+        tests = column.get("data_tests", column.get("tests", []))
+        if not tests:
+            return
+
+        column_name = name if isinstance(name, str) else "<unknown>"
+        self._validate_tests(
+            tests,
+            result,
+            file_path,
+            resource_kind=owner_kind,
+            resource_name=owner_name,
+            column_name=column_name,
+        )
 
     def _validate_tests(
         self,
@@ -545,70 +609,108 @@ class TestConfigValidator(Validator):
             return
 
         for idx, test in enumerate(tests):
-            if isinstance(test, str):
-                if test not in self.VALID_TESTS:
-                    location = (
-                        f"column '{column_name}' of {resource_kind} '{resource_name}'"
-                        if column_name
-                        else f"{resource_kind} '{resource_name}'"
-                    )
-                    result.add_warning(
-                        code="UNKNOWN_TEST",
-                        message=f"Unknown test '{test}' in {location}",
-                        file_path=file_path,
-                        column_name=column_name,
-                    )
-                continue
+            self._validate_test_entry(
+                idx,
+                test,
+                result,
+                file_path,
+                resource_kind,
+                resource_name,
+                column_name,
+            )
 
-            if not isinstance(test, dict):
-                result.add_error(
-                    code="INVALID_TEST_TYPE",
-                    message=f"Test must be a string or dict, got {type(test).__name__}",
-                    file_path=file_path,
-                    column_name=column_name,
-                )
-                continue
+    def _validate_test_entry(
+        self,
+        idx: int,
+        test: t.Any,
+        result: ValidationResult,
+        file_path: Path | None,
+        resource_kind: str,
+        resource_name: str,
+        column_name: str | None,
+    ) -> None:
+        if isinstance(test, str):
+            self._validate_string_test(
+                test, result, file_path, resource_kind, resource_name, column_name
+            )
+            return
 
-            if len(test) != 1:
-                result.add_warning(
-                    code="INVALID_TEST_CONFIG",
-                    message=f"Test configuration at index {idx} should have exactly one key",
-                    file_path=file_path,
-                    column_name=column_name,
-                    context={"test_config": test},
-                )
-                continue
+        if not isinstance(test, dict):
+            result.add_error(
+                code="INVALID_TEST_TYPE",
+                message=f"Test must be a string or dict, got {type(test).__name__}",
+                file_path=file_path,
+                column_name=column_name,
+            )
+            return
 
-            test_name = next(iter(test))
-            test_config = test[test_name]
+        if len(test) != 1:
+            result.add_warning(
+                code="INVALID_TEST_CONFIG",
+                message=f"Test configuration at index {idx} should have exactly one key",
+                file_path=file_path,
+                column_name=column_name,
+                context={"test_config": test},
+            )
+            return
 
-            if test_name == "relationships":
-                self._validate_relationships_test(
-                    test_config,
-                    result,
-                    file_path,
-                    resource_kind,
-                    resource_name,
-                    column_name,
-                )
-            elif test_name == "accepted_values":
-                self._validate_accepted_values_test(
-                    test_config,
-                    result,
-                    file_path,
-                    resource_kind,
-                    resource_name,
-                    column_name,
-                )
-            elif test_name == "unique_combination_of_columns":
-                self._validate_unique_combination_test(
-                    test_config,
-                    result,
-                    file_path,
-                    resource_kind,
-                    resource_name,
-                    column_name,
-                )
+        test_name = next(iter(test))
+        self._validate_named_test(
+            test_name,
+            test[test_name],
+            result,
+            file_path,
+            resource_kind,
+            resource_name,
+            column_name,
+        )
+
+    def _validate_string_test(
+        self,
+        test: str,
+        result: ValidationResult,
+        file_path: Path | None,
+        resource_kind: str,
+        resource_name: str,
+        column_name: str | None,
+    ) -> None:
+        if test in self.VALID_TESTS:
+            return
+
+        location = (
+            f"column '{column_name}' of {resource_kind} '{resource_name}'"
+            if column_name
+            else f"{resource_kind} '{resource_name}'"
+        )
+        result.add_warning(
+            code="UNKNOWN_TEST",
+            message=f"Unknown test '{test}' in {location}",
+            file_path=file_path,
+            column_name=column_name,
+        )
+
+    def _validate_named_test(
+        self,
+        test_name: t.Any,
+        test_config: t.Any,
+        result: ValidationResult,
+        file_path: Path | None,
+        resource_kind: str,
+        resource_name: str,
+        column_name: str | None,
+    ) -> None:
+        if test_name == "relationships":
+            self._validate_relationships_test(
+                test_config, result, file_path, resource_kind, resource_name, column_name
+            )
+        elif test_name == "accepted_values":
+            self._validate_accepted_values_test(
+                test_config, result, file_path, resource_kind, resource_name, column_name
+            )
+        elif test_name == "unique_combination_of_columns":
+            self._validate_unique_combination_test(
+                test_config, result, file_path, resource_kind, resource_name, column_name
+            )
 
     def _extract_test_arguments(
         self,
@@ -814,87 +916,141 @@ class ModelValidator(TestConfigValidator):
             )
             return
 
+        valid_version_entries: list[tuple[int, float | str]] = []
+        for version_idx, version in enumerate(versions):
+            version_name = self._validate_model_version_entry(
+                version_idx,
+                version,
+                model_name,
+                valid_version_entries,
+                result,
+                file_path,
+            )
+            if version_name is not None:
+                self._validate_model_version_body(version, version_name, result, file_path)
+
+        self._validate_latest_model_version(
+            latest_version, model_name, valid_version_entries, result, file_path
+        )
+
+    def _validate_model_version_entry(
+        self,
+        version_idx: int,
+        version: t.Any,
+        model_name: str,
+        valid_version_entries: list[tuple[int, float | str]],
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> str | None:
+        if not isinstance(version, dict):
+            result.add_error(
+                code="INVALID_MODEL_VERSION_ENTRY_TYPE",
+                message=f"Version at index {version_idx} for model '{model_name}' must be a dictionary",
+                file_path=file_path,
+                context={"model_name": model_name, "version_index": version_idx},
+            )
+            return None
+
+        version_value = version.get("v")
+        if version_value is None:
+            result.add_error(
+                code="MISSING_MODEL_VERSION",
+                message=f"Version at index {version_idx} for model '{model_name}' is missing required 'v' field",
+                file_path=file_path,
+                context={"model_name": model_name, "version_index": version_idx},
+            )
+            return f"{model_name}.versions[{version_idx}]"
+
+        if isinstance(version_value, bool) or not isinstance(version_value, (int, float, str)):
+            result.add_error(
+                code="INVALID_MODEL_VERSION",
+                message=(
+                    f"Version 'v' for model '{model_name}' must be an int, float, or string, "
+                    f"got {type(version_value).__name__}"
+                ),
+                file_path=file_path,
+                context={
+                    "model_name": model_name,
+                    "version_index": version_idx,
+                    "version_value": version_value,
+                },
+            )
+            return f"{model_name}.versions[{version_idx}]"
+
+        self._validate_duplicate_model_version(
+            version_idx, version_value, model_name, valid_version_entries, result, file_path
+        )
+        valid_version_entries.append((version_idx, version_value))
+        return f"{model_name}.v{version_value}"
+
+    def _validate_duplicate_model_version(
+        self,
+        version_idx: int,
+        version_value: float | str,
+        model_name: str,
+        valid_version_entries: list[tuple[int, float | str]],
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> None:
         from dbt_osmosis.core.inheritance import _version_values_match
 
-        valid_version_entries: list[tuple[int, int | float | str]] = []
-        for version_idx, version in enumerate(versions):
-            if not isinstance(version, dict):
-                result.add_error(
-                    code="INVALID_MODEL_VERSION_ENTRY_TYPE",
-                    message=f"Version at index {version_idx} for model '{model_name}' must be a dictionary",
-                    file_path=file_path,
-                    context={"model_name": model_name, "version_index": version_idx},
-                )
-                continue
+        duplicate_entry = next(
+            (
+                (seen_idx, seen_value)
+                for seen_idx, seen_value in valid_version_entries
+                if _version_values_match(seen_value, version_value)
+            ),
+            None,
+        )
+        if duplicate_entry is None:
+            return
 
-            version_value = version.get("v")
-            if version_value is None:
-                result.add_error(
-                    code="MISSING_MODEL_VERSION",
-                    message=f"Version at index {version_idx} for model '{model_name}' is missing required 'v' field",
-                    file_path=file_path,
-                    context={"model_name": model_name, "version_index": version_idx},
-                )
-                version_name = f"{model_name}.versions[{version_idx}]"
-            elif isinstance(version_value, bool) or not isinstance(
-                version_value, (int, float, str)
-            ):
-                result.add_error(
-                    code="INVALID_MODEL_VERSION",
-                    message=(
-                        f"Version 'v' for model '{model_name}' must be an int, float, or string, "
-                        f"got {type(version_value).__name__}"
-                    ),
-                    file_path=file_path,
-                    context={
-                        "model_name": model_name,
-                        "version_index": version_idx,
-                        "version_value": version_value,
-                    },
-                )
-                version_name = f"{model_name}.versions[{version_idx}]"
-            else:
-                duplicate_entry = next(
-                    (
-                        (seen_idx, seen_value)
-                        for seen_idx, seen_value in valid_version_entries
-                        if _version_values_match(seen_value, version_value)
-                    ),
-                    None,
-                )
-                if duplicate_entry is not None:
-                    result.add_error(
-                        code="DUPLICATE_MODEL_VERSION",
-                        message=(
-                            f"Duplicate version '{version_value}' for model '{model_name}' "
-                            f"at index {version_idx}"
-                        ),
-                        file_path=file_path,
-                        context={
-                            "model_name": model_name,
-                            "version_index": version_idx,
-                            "first_version_index": duplicate_entry[0],
-                            "version_value": version_value,
-                        },
-                    )
-                valid_version_entries.append((version_idx, version_value))
-                version_name = f"{model_name}.v{version_value}"
+        result.add_error(
+            code="DUPLICATE_MODEL_VERSION",
+            message=(
+                f"Duplicate version '{version_value}' for model '{model_name}' "
+                f"at index {version_idx}"
+            ),
+            file_path=file_path,
+            context={
+                "model_name": model_name,
+                "version_index": version_idx,
+                "first_version_index": duplicate_entry[0],
+                "version_value": version_value,
+            },
+        )
 
-            self._validate_resource_tests(
-                t.cast("dict[str, t.Any]", version),
-                result,
-                file_path,
-                "model version",
-                version_name,
-            )
-            self._validate_columns(
-                version.get("columns", []),
-                result,
-                file_path,
-                "model version",
-                version_name,
-            )
+    def _validate_model_version_body(
+        self,
+        version: t.Any,
+        version_name: str,
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> None:
+        version_dict = t.cast("dict[str, t.Any]", version)
+        self._validate_resource_tests(
+            version_dict,
+            result,
+            file_path,
+            "model version",
+            version_name,
+        )
+        self._validate_columns(
+            version_dict.get("columns", []),
+            result,
+            file_path,
+            "model version",
+            version_name,
+        )
 
+    def _validate_latest_model_version(
+        self,
+        latest_version: t.Any,
+        model_name: str,
+        valid_version_entries: list[tuple[int, float | str]],
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> None:
         if latest_version is None:
             return
         if isinstance(latest_version, bool) or not isinstance(latest_version, (int, float, str)):
@@ -908,6 +1064,8 @@ class ModelValidator(TestConfigValidator):
                 context={"model_name": model_name, "latest_version": latest_version},
             )
             return
+
+        from dbt_osmosis.core.inheritance import _version_values_match
 
         version_values = [version_value for _, version_value in valid_version_entries]
         if not any(
@@ -1009,86 +1167,148 @@ class SourceValidator(TestConfigValidator):
             return
 
         for idx, source in enumerate(sources):
-            if not isinstance(source, dict):
-                result.add_error(
-                    code="INVALID_SOURCE_TYPE",
-                    message=f"Source at index {idx} must be a dictionary",
-                    file_path=file_path,
-                )
-                continue
+            self._validate_source_entry(idx, source, result, file_path)
 
-            # Check source name
-            name = source.get("name")
-            if not name:
-                result.add_error(
-                    code="MISSING_SOURCE_NAME",
-                    message=f"Source at index {idx} is missing required 'name' field",
-                    file_path=file_path,
-                )
-            elif not isinstance(name, str):
-                result.add_error(
-                    code="INVALID_SOURCE_NAME",
-                    message=f"Source name must be a string, got {type(name).__name__}",
-                    file_path=file_path,
-                )
+    def _validate_source_entry(
+        self,
+        idx: int,
+        source: t.Any,
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> None:
+        if not isinstance(source, dict):
+            result.add_error(
+                code="INVALID_SOURCE_TYPE",
+                message=f"Source at index {idx} must be a dictionary",
+                file_path=file_path,
+            )
+            return
 
-            tables = source.get("tables", [])
-            if not tables:
-                result.add_warning(
-                    code="MISSING_SOURCE_TABLES",
-                    message=f"Source '{name}' has no tables defined",
-                    file_path=file_path,
-                )
-                continue
+        name = source.get("name")
+        self._validate_source_name(idx, name, result, file_path)
+        tables = source.get("tables", [])
+        if self._source_tables_are_invalid(name, tables, result, file_path):
+            return
 
-            if not isinstance(tables, list):
-                result.add_error(
-                    code="INVALID_SOURCE_TABLES_TYPE",
-                    message=f"Source '{name}' must define 'tables' as a list",
-                    file_path=file_path,
-                )
-                continue
+        source_name = name if isinstance(name, str) else "<unknown>"
+        self._validate_source_tables(t.cast("list[t.Any]", tables), source_name, result, file_path)
 
-            source_name = name if isinstance(name, str) else "<unknown>"
-            for table_idx, table in enumerate(tables):
-                if not isinstance(table, dict):
-                    result.add_error(
-                        code="INVALID_SOURCE_TABLE_TYPE",
-                        message=f"Table at index {table_idx} in source '{source_name}' must be a dictionary",
-                        file_path=file_path,
-                    )
-                    continue
+    def _validate_source_name(
+        self,
+        idx: int,
+        name: t.Any,
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> None:
+        if not name:
+            result.add_error(
+                code="MISSING_SOURCE_NAME",
+                message=f"Source at index {idx} is missing required 'name' field",
+                file_path=file_path,
+            )
+        elif not isinstance(name, str):
+            result.add_error(
+                code="INVALID_SOURCE_NAME",
+                message=f"Source name must be a string, got {type(name).__name__}",
+                file_path=file_path,
+            )
 
-                table_name = table.get("name")
-                if not table_name:
-                    result.add_error(
-                        code="MISSING_SOURCE_TABLE_NAME",
-                        message=f"Table at index {table_idx} in source '{source_name}' is missing required 'name' field",
-                        file_path=file_path,
-                    )
-                    continue
-                if not isinstance(table_name, str):
-                    result.add_error(
-                        code="INVALID_SOURCE_TABLE_NAME",
-                        message=f"Source table name must be a string, got {type(table_name).__name__}",
-                        file_path=file_path,
-                    )
-                    continue
+    def _source_tables_are_invalid(
+        self,
+        name: t.Any,
+        tables: t.Any,
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> bool:
+        if not tables:
+            result.add_warning(
+                code="MISSING_SOURCE_TABLES",
+                message=f"Source '{name}' has no tables defined",
+                file_path=file_path,
+            )
+            return True
 
-                self._validate_resource_tests(
-                    t.cast("dict[str, t.Any]", table),
-                    result,
-                    file_path,
-                    "source table",
-                    table_name,
-                )
-                self._validate_columns(
-                    table.get("columns", []),
-                    result,
-                    file_path,
-                    "source table",
-                    table_name,
-                )
+        if not isinstance(tables, list):
+            result.add_error(
+                code="INVALID_SOURCE_TABLES_TYPE",
+                message=f"Source '{name}' must define 'tables' as a list",
+                file_path=file_path,
+            )
+            return True
+
+        return False
+
+    def _validate_source_tables(
+        self,
+        tables: list[t.Any],
+        source_name: str,
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> None:
+        for table_idx, table in enumerate(tables):
+            self._validate_source_table(table_idx, table, source_name, result, file_path)
+
+    def _validate_source_table(
+        self,
+        table_idx: int,
+        table: t.Any,
+        source_name: str,
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> None:
+        if not isinstance(table, dict):
+            result.add_error(
+                code="INVALID_SOURCE_TABLE_TYPE",
+                message=f"Table at index {table_idx} in source '{source_name}' must be a dictionary",
+                file_path=file_path,
+            )
+            return
+
+        table_name = table.get("name")
+        if not self._validate_source_table_name(
+            table_idx, table_name, source_name, result, file_path
+        ):
+            return
+
+        table_name = t.cast("str", table_name)
+        self._validate_resource_tests(
+            t.cast("dict[str, t.Any]", table),
+            result,
+            file_path,
+            "source table",
+            table_name,
+        )
+        self._validate_columns(
+            table.get("columns", []),
+            result,
+            file_path,
+            "source table",
+            table_name,
+        )
+
+    def _validate_source_table_name(
+        self,
+        table_idx: int,
+        table_name: t.Any,
+        source_name: str,
+        result: ValidationResult,
+        file_path: Path | None,
+    ) -> bool:
+        if not table_name:
+            result.add_error(
+                code="MISSING_SOURCE_TABLE_NAME",
+                message=f"Table at index {table_idx} in source '{source_name}' is missing required 'name' field",
+                file_path=file_path,
+            )
+            return False
+        if not isinstance(table_name, str):
+            result.add_error(
+                code="INVALID_SOURCE_TABLE_NAME",
+                message=f"Source table name must be a string, got {type(table_name).__name__}",
+                file_path=file_path,
+            )
+            return False
+        return True
 
 
 class SeedValidator(TestConfigValidator):
