@@ -22,12 +22,14 @@ class _CatalogArtifactProtocol(t.Protocol):
     nodes: t.Mapping[str, object]
     sources: t.Mapping[str, object]
 
-    def write(self, path: str) -> None: ...
+    def write(self, path: str) -> None:
+        raise NotImplementedError
 
 
 class _CatalogArtifactFactoryProtocol(t.Protocol):
     @staticmethod
-    def from_dict(data: object) -> _CatalogArtifactProtocol: ...
+    def from_dict(data: object) -> _CatalogArtifactProtocol:
+        raise NotImplementedError
 
     @staticmethod
     def from_results(
