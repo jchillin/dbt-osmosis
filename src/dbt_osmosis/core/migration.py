@@ -32,12 +32,32 @@ from dbt_osmosis.core.diff import (
     SchemaDiffResult,
 )
 
+_BACKTICK_DIALECTS = frozenset({"bigquery", "spark", "databricks"})
 __all__ = [
     "MigrationFormat",
     "MigrationPlan",
     "MigrationPlanner",
     "MigrationStep",
 ]
+
+
+def _is_quoted_identifier_part(
+    part: str, prefix: str, suffix: str, *, require_suffix: bool = False
+) -> bool:
+    if not part.startswith(prefix):
+        return False
+    return part.endswith(suffix) if require_suffix else True
+
+
+def _quote_identifier_parts(
+    parts: list[str], prefix: str, suffix: str, *, require_suffix: bool = False
+) -> str:
+    return ".".join(
+        part
+        if _is_quoted_identifier_part(part, prefix, suffix, require_suffix=require_suffix)
+        else f"{prefix}{part}{suffix}"
+        for part in parts
+    )
 
 
 class MigrationFormat(Enum):
@@ -582,34 +602,10 @@ class MigrationPlanner:
         # Split schema.table if present
         parts = identifier.split(".")
 
-        if self._dialect == "snowflake":
-            # Snowflake uses double quotes, case-insensitive without them
-            quoted = [f'"{part}"' if not part.startswith('"') else part for part in parts]
-            return ".".join(quoted)
-
-        if self._dialect in ("postgres", "redshift", "duckdb"):
-            # Postgres uses double quotes, case-sensitive
-            quoted = [f'"{part}"' if not part.startswith('"') else part for part in parts]
-            return ".".join(quoted)
-
-        if self._dialect == "bigquery":
-            # BigQuery uses backticks
-            quoted = [f"`{part}`" if not part.startswith("`") else part for part in parts]
-            return ".".join(quoted)
-
-        if self._dialect in ("spark", "databricks"):
-            # Spark uses backticks
-            quoted = [f"`{part}`" if not part.startswith("`") else part for part in parts]
-            return ".".join(quoted)
-
         if self._dialect == "sqlserver":
-            # SQL Server uses brackets
-            quoted = [
-                f"[{part}]" if not (part.startswith("[") and part.endswith("]")) else part
-                for part in parts
-            ]
-            return ".".join(quoted)
+            return _quote_identifier_parts(parts, "[", "]", require_suffix=True)
 
-        # Default: use double quotes
-        quoted = [f'"{part}"' if not part.startswith('"') else part for part in parts]
-        return ".".join(quoted)
+        if self._dialect in _BACKTICK_DIALECTS:
+            return _quote_identifier_parts(parts, "`", "`")
+
+        return _quote_identifier_parts(parts, '"', '"')
