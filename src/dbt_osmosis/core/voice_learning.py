@@ -15,6 +15,21 @@ if t.TYPE_CHECKING:
 
     from dbt_osmosis.core.dbt_protocols import YamlRefactorContextProtocol
 
+_COMMON_PHRASE_STOP_WORDS = frozenset({"the", "a", "an", "of", "in", "and", "or", "for"})
+_IMPERATIVE_VERBS = frozenset({"contains", "represents", "stores", "holds", "tracks", "records"})
+_PASSIVE_PATTERNS = frozenset({"is used to", "is a", "contains a", "represents a"})
+_TECH_TERMS = frozenset({
+    "id",
+    "key",
+    "fk",
+    "pk",
+    "timestamp",
+    "json",
+    "uuid",
+    "integer",
+    "varchar",
+})
+
 __all__ = [
     "ProjectStyleProfile",
     "analyze_project_documentation_style",
@@ -131,24 +146,32 @@ def _extract_common_phrases(
     if not descriptions:
         return []
 
-    # Tokenize and extract n-grams (2-4 words)
-    words_by_desc = [d.lower().split() for d in descriptions if d and d.strip()]
-
     phrases: Counter[str] = Counter()
-
-    for words in words_by_desc:
-        # Extract 2-grams, 3-grams, and 4-grams
-        for n in [2, 3, 4]:
-            for i in range(len(words) - n + 1):
-                phrase = " ".join(words[i : i + n])
-                # Filter out very common words
-                if not any(
-                    w in ["the", "a", "an", "of", "in", "and", "or", "for"] for w in phrase.split()
-                ):
-                    phrases[phrase] += 1
+    for phrase in _iter_common_phrase_candidates(descriptions):
+        phrases[phrase] += 1
 
     # Return most common phrases above threshold
     return [(p, c) for p, c in phrases.most_common(20) if c >= min_frequency]
+
+
+def _iter_common_phrase_candidates(descriptions: list[str]) -> t.Iterator[str]:
+    for desc in descriptions:
+        if not desc or not desc.strip():
+            continue
+        words = desc.lower().split()
+        for n in [2, 3, 4]:
+            yield from _iter_informative_ngrams(words, n)
+
+
+def _iter_informative_ngrams(words: list[str], n: int) -> t.Iterator[str]:
+    for i in range(len(words) - n + 1):
+        phrase = " ".join(words[i : i + n])
+        if _is_informative_phrase(phrase):
+            yield phrase
+
+
+def _is_informative_phrase(phrase: str) -> bool:
+    return not any(word in _COMMON_PHRASE_STOP_WORDS for word in phrase.split())
 
 
 def _detect_terminology_patterns(
@@ -212,30 +235,26 @@ def _detect_tone_markers(descriptions: list[str]) -> dict[str, int]:
         if not desc or not desc.strip():
             continue
 
-        words = desc.split()
-        word_count = len(words)
-
-        # Detect concise vs detailed
-        if word_count <= 5:
-            markers["concise"] += 1
-        elif word_count >= 15:
-            markers["detailed"] += 1
-
-        # Detect imperative vs passive
-        imperative_verbs = ["contains", "represents", "stores", "holds", "tracks", "records"]
-        passive_patterns = ["is used to", "is a", "contains a", "represents a"]
-
-        if any(v in desc.lower() for v in imperative_verbs):
-            markers["imperative"] += 1
-        if any(p in desc.lower() for p in passive_patterns):
-            markers["passive"] += 1
-
-        # Detect technical terms
-        tech_terms = ["id", "key", "fk", "pk", "timestamp", "json", "uuid", "integer", "varchar"]
-        if any(term in desc.lower() for term in tech_terms):
-            markers["technical"] += 1
+        _count_description_tone_markers(markers, desc)
 
     return markers
+
+
+def _count_description_tone_markers(markers: dict[str, int], desc: str) -> None:
+    word_count = len(desc.split())
+    desc_lower = desc.lower()
+
+    if word_count <= 5:
+        markers["concise"] += 1
+    elif word_count >= 15:
+        markers["detailed"] += 1
+
+    if any(verb in desc_lower for verb in _IMPERATIVE_VERBS):
+        markers["imperative"] += 1
+    if any(pattern in desc_lower for pattern in _PASSIVE_PATTERNS):
+        markers["passive"] += 1
+    if any(term in desc_lower for term in _TECH_TERMS):
+        markers["technical"] += 1
 
 
 def analyze_project_documentation_style(
@@ -253,6 +272,17 @@ def analyze_project_documentation_style(
     Returns:
         ProjectStyleProfile with discovered patterns
     """
+    model_descriptions, column_descriptions, column_names = _collect_documentation_samples(
+        context, max_nodes, max_columns_per_node
+    )
+    return _build_style_profile(model_descriptions, column_descriptions, column_names)
+
+
+def _collect_documentation_samples(
+    context: YamlRefactorContextProtocol,
+    max_nodes: int,
+    max_columns_per_node: int,
+) -> tuple[list[str], list[str], list[str]]:
     from dbt_osmosis.core.node_filters import _iter_candidate_nodes
 
     model_descriptions: list[str] = []
@@ -275,7 +305,14 @@ def analyze_project_documentation_style(
                 column_descriptions.append(col.description)
                 column_names.append(col_name)
 
-    # Build profile
+    return model_descriptions, column_descriptions, column_names
+
+
+def _build_style_profile(
+    model_descriptions: list[str],
+    column_descriptions: list[str],
+    column_names: list[str],
+) -> ProjectStyleProfile:
     profile = ProjectStyleProfile()
 
     # Analyze lengths
@@ -379,31 +416,54 @@ def extract_style_examples(
     Returns:
         Dictionary with example lists by category
     """
-    examples: dict[str, list[str]] = {
+    if target_node:
+        return _targeted_style_examples(context, target_node, max_examples)
+
+    return _project_style_examples(context, max_examples)
+
+
+def _empty_style_examples() -> dict[str, list[str]]:
+    return {
         "model_descriptions": [],
         "column_descriptions": [],
     }
 
-    if target_node:
-        # Find similar nodes for targeted examples
-        similar_nodes = find_similar_documented_nodes(context, target_node, max_examples)
 
-        for node, _ in similar_nodes:
-            if node.description and node.description not in context.placeholders:
-                examples["model_descriptions"].append(f"# {node.name}\n{node.description}")
+def _targeted_style_examples(
+    context: YamlRefactorContextProtocol,
+    target_node: ResultNode,
+    max_examples: int,
+) -> dict[str, list[str]]:
+    examples = _empty_style_examples()
+    for node, _ in find_similar_documented_nodes(context, target_node, max_examples):
+        _append_node_style_examples(examples, context, node)
+    return examples
 
-            for col_name, col in list(node.columns.items())[:3]:
-                if col.description and col.description not in context.placeholders:
-                    examples["column_descriptions"].append(f"- {col_name}: {col.description}")
-    else:
-        # Use general project style
-        profile = analyze_project_documentation_style(context, max_nodes=20)
-        examples["model_descriptions"] = [
+
+def _append_node_style_examples(
+    examples: dict[str, list[str]],
+    context: YamlRefactorContextProtocol,
+    node: ResultNode,
+) -> None:
+    if node.description and node.description not in context.placeholders:
+        examples["model_descriptions"].append(f"# {node.name}\n{node.description}")
+
+    for col_name, col in list(node.columns.items())[:3]:
+        if col.description and col.description not in context.placeholders:
+            examples["column_descriptions"].append(f"- {col_name}: {col.description}")
+
+
+def _project_style_examples(
+    context: YamlRefactorContextProtocol,
+    max_examples: int,
+) -> dict[str, list[str]]:
+    profile = analyze_project_documentation_style(context, max_nodes=20)
+    return {
+        "model_descriptions": [
             f"# Example {i}\n{desc}"
             for i, desc in enumerate(profile.model_description_samples[:max_examples], 1)
-        ]
-        examples["column_descriptions"] = [
+        ],
+        "column_descriptions": [
             f"- {desc}" for desc in profile.column_description_samples[:max_examples]
-        ]
-
-    return examples
+        ],
+    }
