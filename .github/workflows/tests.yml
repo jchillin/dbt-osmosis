@@ -297,6 +297,61 @@ jobs:
           test ! -e test.db
           test ! -e demo_duckdb/target
 
+  dbt-v2-hybrid:
+    name: Validate dbt v2 hybrid workflow
+    runs-on: ubuntu-latest
+    needs: lockfile
+    env:
+      UV_NO_PROGRESS: "1"
+      DBT_V2_SPEC: "dbt-oss==2.0.5"
+      DBT_AUTOFIX_SPEC: "dbt-autofix==0.22.6"
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11 # v4.1.1
+
+      - name: Set up Python
+        uses: actions/setup-python@82c7e631bb3cdc910f68e0081d67478d79c6982d # v5.1.0
+        with:
+          python-version: "3.12"
+
+      - name: Upgrade pip
+        run: |
+          pip install --constraint=.github/workflows/constraints.txt pip
+          pip --version
+
+      - name: Install uv
+        run: |
+          pip install --constraint=.github/workflows/constraints.txt uv
+          uv --version
+
+      # dbt v2 and dbt-core both install a `dbt` package, so each tool gets its own environment.
+      - name: Create environments
+        run: |
+          OSMOSIS_ENV="${RUNNER_TEMP}/dbt-osmosis-v2-hybrid"
+          V2_ENV="${RUNNER_TEMP}/dbt-v2"
+          AUTOFIX_ENV="${RUNNER_TEMP}/dbt-autofix"
+          uv venv --python "3.12" "$OSMOSIS_ENV"
+          uv --no-config pip install --python "$OSMOSIS_ENV/bin/python" -e ".[duckdb]" "dbt-core~=1.12.0" "dbt-duckdb~=1.11.0" "$DBT_ADAPTERS_CONSTRAINT"
+          uv --no-config pip check --python "$OSMOSIS_ENV/bin/python"
+          uv venv --python "3.12" "$V2_ENV"
+          uv --no-config pip install --python "$V2_ENV/bin/python" "$DBT_V2_SPEC"
+          uv venv --python "3.12" "$AUTOFIX_ENV"
+          uv --no-config pip install --python "$AUTOFIX_ENV/bin/python" "$DBT_AUTOFIX_SPEC"
+          echo "VIRTUAL_ENV=$OSMOSIS_ENV" >> "$GITHUB_ENV"
+          echo "$OSMOSIS_ENV/bin" >> "$GITHUB_PATH"
+          echo "DBT_V2_BIN=$V2_ENV/bin/dbt" >> "$GITHUB_ENV"
+          echo "DBT_AUTOFIX_BIN=$AUTOFIX_ENV/bin/dbt-autofix" >> "$GITHUB_ENV"
+
+      - name: Run hybrid workflow check
+        run: |
+          demo_duckdb/dbt_v2_hybrid_tests.sh
+
+      - name: Assert source fixture artifacts absent
+        run: |
+          test ! -e test.db
+          test ! -e demo_duckdb/target
+
   future-dbt-canary:
     name: Canary latest dbt Core compatibility
     runs-on: ubuntu-latest
