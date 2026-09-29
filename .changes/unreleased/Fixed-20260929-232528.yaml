@@ -1,0 +1,8 @@
+kind: Fixed
+body: |-
+    Leave a dbt v2 `target/manifest.json` in place when dbt-osmosis parses the project with dbt-core.
+
+    - dbt v2 reads that manifest for state selection and deferral, and dbt-osmosis used to replace it with its own dbt-core manifest. Projects without a dbt v2 manifest still get the dbt-core manifest written as before.
+    - Keeping the manifest also keeps fusion-compat detection stable across repeated runs.
+    - The docs now cover the full hybrid workflow: separate environments, migrating with `dbt-autofix`, `+meta: {dbt-osmosis: ...}` routing, and dbt-core 1.10.5 or later for migrated YAML. CI checks that workflow against `dbt-oss` 2.0.5.
+time: 2026-09-29T23:25:28Z

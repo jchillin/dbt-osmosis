@@ -172,10 +172,10 @@ def _detect_fusion_manifest(project_dir: str) -> bool:
     environment for dbt-osmosis, this detection ensures dbt-osmosis outputs
     Fusion-compatible YAML even if the installed dbt-core is older.
 
-    The check reads the existing manifest.json before osmosis re-parses the
-    project, since parsing via dbt-core would overwrite it with a dbt-core manifest.
-    Only the leading metadata is read unless it shows v2 evidence; then the whole
-    file must also be valid JSON.
+    The check runs before osmosis re-parses the project with dbt-core. When it
+    returns True, that parse leaves the manifest in place for dbt v2. Only the
+    leading metadata is read unless it shows v2 evidence; then the whole file
+    must also be valid JSON.
 
     Args:
         project_dir: Path to the dbt project root.
@@ -698,6 +698,43 @@ def _bind_project_adapter(project: InterfaceDbtProject) -> None:
         )
 
 
+def _load_interface_project(
+    interface_config: InterfaceDbtConfiguration,
+    *,
+    write_manifest: bool,
+) -> InterfaceDbtProject:
+    """Create and parse the dbt-core-interface project.
+
+    Args:
+        interface_config: The dbt-core-interface configuration.
+        write_manifest: Whether dbt-core may write the parsed manifest to
+            ``target/manifest.json``. Pass False when that file belongs to
+            dbt v2, which reads it for state selection and deferral. This
+            only covers the initial parse: when dbt-core-interface reuses a
+            project for the same root with a different target, profile, or
+            vars, its ``DbtProject.args`` setter re-parses and writes anyway.
+
+    Returns:
+        The parsed project.
+
+    """
+    if write_manifest:
+        return InterfaceDbtProject.from_config(interface_config)
+
+    logger.info(":lock: Leaving the dbt v2 target/manifest.json in place")
+    project = InterfaceDbtProject(
+        target=interface_config.target,
+        profiles_dir=interface_config.profiles_dir,
+        project_dir=interface_config.project_dir,
+        threads=interface_config.threads,
+        vars=interface_config.vars,
+        profile=interface_config.profile,
+        load=False,
+    )
+    project.parse_project(write_manifest=False)
+    return project
+
+
 def create_dbt_project_context(config: DbtConfiguration) -> DbtProjectContext:
     """Build a DbtProjectContext from a DbtConfiguration.
 
@@ -713,16 +750,11 @@ def create_dbt_project_context(config: DbtConfiguration) -> DbtProjectContext:
     """
     logger.info(":wave: Creating DBT project context using config => %s", config)
 
-    # Check for a Fusion-generated manifest BEFORE parsing, since dbt-core's
-    # parser will overwrite it with a v12 manifest. This allows teams running
-    # both dbt Fusion and dbt-core to get fusion_compat=True automatically.
+    # Check for a dbt v2 manifest before parsing, so teams running dbt v2
+    # alongside dbt-core get fusion_compat=True automatically.
     is_fusion = _detect_fusion_manifest(config.project_dir)
 
-    # Create the interface config
-    interface_config = config.to_interface_config()
-
-    # Create DbtProject instance (this loads the manifest)
-    project = InterfaceDbtProject.from_config(interface_config)
+    project = _load_interface_project(config.to_interface_config(), write_manifest=not is_fusion)
     _bind_project_adapter(project)
 
     # Handle dbt-loom cross-project references if available

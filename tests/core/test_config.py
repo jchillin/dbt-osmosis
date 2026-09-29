@@ -23,6 +23,7 @@ from dbt_osmosis.core.config import (
     discover_project_dir,
 )
 from dbt_osmosis.core.settings import YamlRefactorContext
+from tests.support import create_temp_project_copy
 
 _V12_SCHEMA_URL = "https://schemas.getdbt.com/dbt/manifest/v12.json"
 _NODES_PAST_READ_WINDOW = {"model.demo.big": {"description": "x" * (_MANIFEST_HEAD_CHARS + 1)}}
@@ -563,3 +564,55 @@ class TestDetectFusionManifest:
         manifest = {"metadata": {"dbt_schema_version": ""}}
         (target / "manifest.json").write_text(json.dumps(manifest))
         assert _detect_fusion_manifest(str(tmp_path)) is False
+
+
+class TestProjectContextManifestWrite:
+    """create_dbt_project_context() parses with dbt-core; these cover what it leaves in target/."""
+
+    @staticmethod
+    def _demo_project_with_manifest(tmp_path: Path, manifest: dict[str, object]) -> Path:
+        project_dir = create_temp_project_copy(Path("demo_duckdb"), tmp_path)
+        manifest_path = project_dir / "target" / "manifest.json"
+        manifest_path.parent.mkdir()
+        manifest_path.write_text(json.dumps(manifest))
+        return project_dir
+
+    @staticmethod
+    def _create_context(project_dir: Path):
+        return create_dbt_project_context(
+            DbtConfiguration(
+                project_dir=str(project_dir),
+                profiles_dir=str(project_dir),
+                target="test",
+            )
+        )
+
+    def test_keeps_dbt_v2_manifest(self, tmp_path):
+        """dbt v2 reads target/manifest.json for state and deferral, so osmosis must not replace it."""
+        project_dir = self._demo_project_with_manifest(
+            tmp_path,
+            {"metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "2.0.5"}},
+        )
+        manifest_path = project_dir / "target" / "manifest.json"
+        v2_manifest = manifest_path.read_bytes()
+
+        with self._create_context(project_dir) as context:
+            assert context.is_fusion_manifest is True
+            assert "model.jaffle_shop_duckdb.orders" in context.manifest.nodes
+
+        assert manifest_path.read_bytes() == v2_manifest
+
+    def test_replaces_dbt_core_manifest(self, tmp_path):
+        """Without dbt v2 evidence, osmosis still writes its fresh dbt-core manifest."""
+        project_dir = self._demo_project_with_manifest(
+            tmp_path,
+            {"metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "1.10.0"}},
+        )
+
+        with self._create_context(project_dir) as context:
+            assert context.is_fusion_manifest is False
+            dbt_core_version = context.dbt_version
+
+        written = json.loads((project_dir / "target" / "manifest.json").read_text())
+        assert written["metadata"]["dbt_version"] == dbt_core_version
+        assert "model.jaffle_shop_duckdb.orders" in written["nodes"]
