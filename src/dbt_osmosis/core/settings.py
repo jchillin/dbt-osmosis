@@ -91,8 +91,8 @@ class YamlRefactorSettings:
     formatter: str | None = None
     """External command to format written YAML files (e.g. 'prettier --write'). File paths appended as args."""
     fusion_compat: bool | None = None
-    """When True, output Fusion-compatible YAML with meta/tags nested inside config blocks.
-    When False, output classic format with meta/tags at top level.
+    """When True, output Fusion-compatible YAML with column meta/tags nested inside config blocks.
+    When False, output classic format with column meta/tags at top level.
     When None (default), auto-detect from dbt v2 manifest evidence or installed dbt version:
     True if target/manifest.json was written by the dbt v2 engine or dbt >= 1.9.6."""
 

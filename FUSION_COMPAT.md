@@ -1,5 +1,7 @@
 # dbt-fusion Compatibility Findings
 
+> **Update, 2026-09-29:** dbt Fusion shipped as dbt v2 (`dbt` and `dbt-oss`) on 2026-09-16, and these findings predate that release. The maintained hybrid workflow is in the [configuration guide](docs/docs/tutorial-yaml/configuration.md#hybrid-workflow-for-fusion-projects). It also answers the open question about `--fusion-compat` output: once `dbt-autofix` has migrated a project, dbt v2 accepts the YAML dbt-osmosis writes. `demo_duckdb/dbt_v2_hybrid_tests.sh` checks this in CI, and `+meta: {dbt-osmosis: ...}` routing works on both engines.
+
 Tracked from real-world testing on [oem-dbt-bigquery](https://github.com/RicardoAGL/oem-dbt-bigquery) (BigQuery, Kimball star schema, 15+ models).
 
 dbt-fusion version: **2.0.0-preview.154** | dbt-core 1.12.0b2 + dbt-core-experimental-parser 2.0.0a1 (tested 2026-06-01)
