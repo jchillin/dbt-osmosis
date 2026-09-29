@@ -9,7 +9,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 from dbt_osmosis.core.config import (
+    _MANIFEST_HEAD_CHARS,
     DbtConfiguration,
     _add_cross_project_references,
     _detect_fusion_manifest,
@@ -20,6 +23,13 @@ from dbt_osmosis.core.config import (
     discover_project_dir,
 )
 from dbt_osmosis.core.settings import YamlRefactorContext
+
+_V12_SCHEMA_URL = "https://schemas.getdbt.com/dbt/manifest/v12.json"
+_NODES_PAST_READ_WINDOW = {"model.demo.big": {"description": "x" * (_MANIFEST_HEAD_CHARS + 1)}}
+_LARGE_V2_MANIFEST_TEXT = json.dumps({
+    "metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "2.0.5"},
+    "nodes": _NODES_PAST_READ_WINDOW,
+})
 
 
 def test_discover_project_dir(tmp_path):
@@ -334,6 +344,13 @@ def test_adapter_ttl_expiration(yaml_context: YamlRefactorContext):
 class TestDetectFusionManifest:
     """Tests for _detect_fusion_manifest() Fusion detection logic."""
 
+    @staticmethod
+    def _detect(tmp_path, manifest_text: str) -> bool:
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "manifest.json").write_text(manifest_text)
+        return _detect_fusion_manifest(str(tmp_path))
+
     def test_no_manifest_returns_false(self, tmp_path):
         """Without a manifest, there is no project-local Fusion evidence."""
         assert _detect_fusion_manifest(str(tmp_path)) is False
@@ -378,6 +395,139 @@ class TestDetectFusionManifest:
         }
         (target / "manifest.json").write_text(json.dumps(manifest))
         assert _detect_fusion_manifest(str(tmp_path)) is True
+
+    def test_dbt_v2_ga_manifest_v12(self, tmp_path):
+        """dbt v2 GA manifest (schema v12, dbt_version 2.x, compact JSON) → returns True."""
+        target = tmp_path / "target"
+        target.mkdir()
+        manifest = {
+            "metadata": {
+                "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+                "dbt_version": "2.0.5",
+                "adapter_type": "duckdb",
+            },
+            "nodes": {},
+        }
+        (target / "manifest.json").write_text(json.dumps(manifest, separators=(",", ":")))
+        assert _detect_fusion_manifest(str(tmp_path)) is True
+
+    @pytest.mark.parametrize("dbt_version", ["2.0.0-rc8", "2.0.0-preview.154"])
+    def test_dbt_v2_prerelease_manifest(self, tmp_path, dbt_version):
+        """dbt v2 pre-release and Fusion preview version strings → returns True."""
+        target = tmp_path / "target"
+        target.mkdir()
+        manifest = {
+            "metadata": {
+                "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+                "dbt_version": dbt_version,
+            },
+        }
+        (target / "manifest.json").write_text(json.dumps(manifest))
+        assert _detect_fusion_manifest(str(tmp_path)) is True
+
+    @pytest.mark.parametrize("dbt_version", ["1.10.20", "1.12.0b2"])
+    def test_dbt_core_v1_manifest_versions(self, tmp_path, dbt_version):
+        """dbt-core 1.x release and pre-release manifests → returns False."""
+        target = tmp_path / "target"
+        target.mkdir()
+        manifest = {
+            "metadata": {
+                "dbt_schema_version": "https://schemas.getdbt.com/dbt/manifest/v12.json",
+                "dbt_version": dbt_version,
+            },
+        }
+        (target / "manifest.json").write_text(json.dumps(manifest))
+        assert _detect_fusion_manifest(str(tmp_path)) is False
+
+    def test_dbt_v2_manifest_larger_than_read_window(self, tmp_path):
+        """A valid v2 manifest larger than the metadata read window → returns True."""
+        assert self._detect(tmp_path, _LARGE_V2_MANIFEST_TEXT) is True
+
+    def test_dbt_core_manifest_is_not_validated_past_metadata(self, tmp_path):
+        """Without v2 evidence in metadata, the rest of the manifest is never read."""
+        manifest = {
+            "metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "1.11.2"},
+            "nodes": _NODES_PAST_READ_WINDOW,
+        }
+        with mock.patch("dbt_osmosis.core.config.validate_json_file") as validate:
+            assert self._detect(tmp_path, json.dumps(manifest)) is False
+        validate.assert_not_called()
+
+    @pytest.mark.parametrize(
+        "manifest_text",
+        [
+            pytest.param(_LARGE_V2_MANIFEST_TEXT[:-5], id="truncated-inside-node-string"),
+            pytest.param(_LARGE_V2_MANIFEST_TEXT[:-1], id="truncated-before-final-brace"),
+            pytest.param(_LARGE_V2_MANIFEST_TEXT[:-1] + ',"sources":nope}', id="invalid-token"),
+            pytest.param(_LARGE_V2_MANIFEST_TEXT + "{}", id="trailing-data"),
+        ],
+    )
+    def test_malformed_v2_manifest_larger_than_read_window(self, tmp_path, manifest_text):
+        """Valid v2 metadata followed by malformed JSON past the read window → returns False."""
+        assert self._detect(tmp_path, manifest_text) is False
+
+    @pytest.mark.parametrize(
+        "manifest_text",
+        [
+            pytest.param(
+                f'{{"metadata":{{"dbt_schema_version":"{_V12_SCHEMA_URL}","dbt_version":"2.0.5"',
+                id="inside-metadata",
+            ),
+            pytest.param(
+                f'{{"metadata":{{"dbt_schema_version":"{_V12_SCHEMA_URL}","dbt_version":"2.0.5"}},"nodes":{{',
+                id="after-metadata",
+            ),
+        ],
+    )
+    def test_truncated_manifest_with_v2_version(self, tmp_path, manifest_text):
+        """Truncated JSON containing "dbt_version":"2.0.5" → returns False."""
+        assert self._detect(tmp_path, manifest_text) is False
+
+    @pytest.mark.parametrize(
+        "manifest",
+        [
+            pytest.param(
+                {
+                    "dbt_version": "2.0.5",
+                    "metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "1.11.2"},
+                },
+                id="top-level",
+            ),
+            pytest.param(
+                {
+                    "metadata": {
+                        "env": {"dbt_version": "2.0.5"},
+                        "dbt_schema_version": _V12_SCHEMA_URL,
+                        "dbt_version": "1.11.2",
+                    },
+                },
+                id="metadata-env",
+            ),
+            pytest.param(
+                {
+                    "metadata": {"dbt_schema_version": _V12_SCHEMA_URL},
+                    "nodes": {"model.demo.a": {"dbt_version": "2.0.5"}},
+                },
+                id="node",
+            ),
+            pytest.param(
+                {
+                    "nodes": {"model.demo.a": {"dbt_version": "2.0.5"}, **_NODES_PAST_READ_WINDOW},
+                    "metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "1.11.2"},
+                },
+                id="node-before-metadata-past-read-window",
+            ),
+        ],
+    )
+    def test_dbt_version_outside_metadata(self, tmp_path, manifest):
+        """A v2 dbt_version anywhere but metadata.dbt_version → returns False."""
+        assert self._detect(tmp_path, json.dumps(manifest)) is False
+
+    @pytest.mark.parametrize("dbt_version", ["2.not-a-version", "2.", "2..0", "2.0.5-"])
+    def test_invalid_v2_version_strings(self, tmp_path, dbt_version):
+        """dbt_version strings that start with 2 but aren't versions → returns False."""
+        manifest = {"metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": dbt_version}}
+        assert self._detect(tmp_path, json.dumps(manifest)) is False
 
     def test_future_manifest_v13(self, tmp_path):
         """Synthetic future dbt-core manifest versions do not prove Fusion."""

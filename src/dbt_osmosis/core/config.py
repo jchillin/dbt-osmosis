@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import json
 import os
 import re
 import threading
@@ -27,10 +28,12 @@ from dbt.contracts.graph.nodes import ModelNode
 # Import from dbt-core-interface instead of internal dbt modules
 from dbt_core_interface import DbtConfiguration as InterfaceDbtConfiguration
 from dbt_core_interface import DbtProject as InterfaceDbtProject
+from packaging.version import InvalidVersion
 from packaging.version import parse as parse_version
 from typing_extensions import Self
 
 from dbt_osmosis.core import logger
+from dbt_osmosis.core.json_stream import validate_json_file
 
 # Import dbt version for compatibility checking
 # Use a try/except in case the version module structure changes
@@ -52,6 +55,11 @@ except (ImportError, AttributeError):
 # Matches "/v12.json" at the end of "https://schemas.getdbt.com/dbt/manifest/v12.json"
 _SCHEMA_VERSION_RE = re.compile(r"/v(\d+)(?:\.json)?$")
 _KNOWN_FUSION_MANIFEST_SCHEMA_VERSIONS = {20}
+_MIN_RUST_ENGINE_MAJOR_VERSION = 2
+# Full manifests can be 100MB+, so detection reads a bounded prefix. The whole
+# metadata object has to fit inside it.
+_MANIFEST_HEAD_CHARS = 64 * 1024
+_LEADING_METADATA_KEY_RE = re.compile(r'\s*\{\s*"metadata"\s*:\s*')
 
 
 def _set_project_manifest(project: InterfaceDbtProject, manifest: Manifest) -> None:
@@ -92,22 +100,88 @@ def _cleanup_stale_adapter(registered_adapter: object, adapter_type: str) -> Non
     )
 
 
-def _detect_fusion_manifest(project_dir: str) -> bool:
-    """Check if the target directory contains a manifest produced by dbt Fusion.
+def _read_manifest_metadata(manifest_path: Path) -> object:
+    """Decode the ``metadata`` object at the start of a manifest from a bounded prefix.
 
-    dbt Fusion is a standalone Rust-based engine with known manifest evidence
-    distinct from dbt-core's manifest schema history. When teams run both
-    dbt-core and Fusion side by side, this detection ensures dbt-osmosis outputs
+    dbt-core and dbt v2 both write ``metadata`` as the first top-level key, and
+    only that position is trusted. The object has to decode completely inside
+    the read window. The rest of the file is not checked here.
+
+    Args:
+        manifest_path: Path to a manifest.json file.
+
+    Returns:
+        The decoded ``metadata`` value, or None if the manifest doesn't start with one.
+
+    Raises:
+        OSError: If the file can't be read.
+        ValueError: If the prefix isn't UTF-8 or the metadata object is invalid JSON.
+    """
+    with open(manifest_path, encoding="utf-8") as f:
+        head = f.read(_MANIFEST_HEAD_CHARS)
+
+    leading_key = _LEADING_METADATA_KEY_RE.match(head)
+    if leading_key is None:
+        return None
+    return t.cast(object, json.JSONDecoder().raw_decode(head, leading_key.end())[0])
+
+
+def _major_version(value: object) -> int | None:
+    """Return the major version of a PEP 440 version string, or None if ``value`` isn't one."""
+    if not isinstance(value, str):
+        return None
+    try:
+        return parse_version(value).major
+    except InvalidVersion:
+        return None
+
+
+def _rust_engine_manifest_evidence(metadata: object) -> str | None:
+    """Describe what in manifest metadata proves the dbt v2 Rust engine wrote it.
+
+    Two signals count: the schema v20 used by Fusion previews, and a valid
+    ``dbt_version`` of 2.0 or later, which dbt v2 (``dbt`` and ``dbt OSS``)
+    reports alongside a v12 schema URL.
+
+    Args:
+        metadata: The decoded top-level ``metadata`` value of a manifest.
+
+    Returns:
+        A short description of the evidence, or None if the metadata shows none.
+    """
+    if not isinstance(metadata, dict):
+        return None
+    fields = t.cast("dict[str, object]", metadata)
+
+    schema_url = fields.get("dbt_schema_version")
+    schema_match = _SCHEMA_VERSION_RE.search(schema_url) if isinstance(schema_url, str) else None
+    if schema_match and int(schema_match.group(1)) in _KNOWN_FUSION_MANIFEST_SCHEMA_VERSIONS:
+        return f"schema v{schema_match.group(1)}"
+
+    major = _major_version(fields.get("dbt_version"))
+    if major is not None and major >= _MIN_RUST_ENGINE_MAJOR_VERSION:
+        return f"dbt_version {fields['dbt_version']}"
+    return None
+
+
+def _detect_fusion_manifest(project_dir: str) -> bool:
+    """Check if the target directory contains a manifest produced by the dbt v2 engine.
+
+    dbt v2 is the Rust engine distributed as ``dbt`` and ``dbt OSS`` (formerly
+    dbt Fusion and dbt Core v2). When teams run it side by side with a dbt-core
+    environment for dbt-osmosis, this detection ensures dbt-osmosis outputs
     Fusion-compatible YAML even if the installed dbt-core is older.
 
     The check reads the existing manifest.json before osmosis re-parses the
-    project, since parsing via dbt-core would overwrite it with a v12 manifest.
+    project, since parsing via dbt-core would overwrite it with a dbt-core manifest.
+    Only the leading metadata is read unless it shows v2 evidence; then the whole
+    file must also be valid JSON.
 
     Args:
         project_dir: Path to the dbt project root.
 
     Returns:
-        True if an existing manifest proves the project was last parsed by dbt Fusion.
+        True if an existing, complete manifest proves the project was last parsed by the dbt v2 engine.
     """
     manifest_path = Path(project_dir) / "target" / "manifest.json"
     if not manifest_path.exists():
@@ -116,33 +190,23 @@ def _detect_fusion_manifest(project_dir: str) -> bool:
         return False
 
     try:
-        with open(manifest_path) as f:
-            # Read only the first 4KB — metadata is always near the top of the manifest,
-            # and full manifests can be 100MB+ for large projects.
-            header = f.read(4096)
-        schema_match = re.search(r'"dbt_schema_version"\s*:\s*"([^"]+)"', header)
-        schema_version = schema_match.group(1) if schema_match else ""
-        match = _SCHEMA_VERSION_RE.search(schema_version)
-        if match:
-            version_num = int(match.group(1))
-            if version_num in _KNOWN_FUSION_MANIFEST_SCHEMA_VERSIONS:
-                logger.info(
-                    ":rocket: Fusion manifest detected (schema v%d) at %s",
-                    version_num,
-                    manifest_path,
-                )
-                return True
-            if version_num > 12:
-                logger.debug(
-                    ":information_source: Manifest schema v%d at %s is not known Fusion evidence; %s",
-                    version_num,
-                    manifest_path,
-                    "leaving fusion_compat auto-detection to dbt version or explicit override",
-                )
+        evidence = _rust_engine_manifest_evidence(_read_manifest_metadata(manifest_path))
+        if evidence is not None:
+            validate_json_file(manifest_path)
     except Exception as e:  # noqa: BLE001
         logger.debug(":information_source: Could not check manifest for Fusion: %s", e)
+        return False
 
-    return False
+    if evidence is None:
+        logger.debug(
+            ":information_source: Manifest at %s shows no dbt v2 engine evidence; %s",
+            manifest_path,
+            "leaving fusion_compat auto-detection to dbt version or explicit override",
+        )
+        return False
+
+    logger.info(":rocket: dbt v2 engine manifest detected (%s) at %s", evidence, manifest_path)
+    return True
 
 
 __all__ = [
@@ -331,12 +395,13 @@ class DbtProjectContext:
     """
 
     is_fusion_manifest: bool = field(init=False, repr=False)
-    """Whether a dbt Fusion manifest was detected in the target directory.
+    """Whether a dbt v2 engine manifest was detected in the target directory.
 
-    dbt Fusion is a standalone Rust-based engine with known manifest evidence
-    (for example schema v20). When True, fusion_compat should be enabled
-    regardless of the installed dbt-core version, since the project is being
-    actively built with Fusion.
+    The dbt v2 Rust engine (``dbt``, ``dbt OSS``, and earlier Fusion previews)
+    is identified by ``metadata.dbt_version`` 2.0 or later, or by the Fusion
+    preview schema v20. When True, fusion_compat should be enabled regardless
+    of the installed dbt-core version, since the project is being actively
+    built with the v2 engine.
     """
 
     is_dbt_v1_10_or_greater: bool = field(init=False, repr=False)

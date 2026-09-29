@@ -107,7 +107,7 @@ dbt-osmosis can produce **Fusion-compatible YAML** where `meta` and `tags` are n
 
 By default (`--fusion-compat` not specified), dbt-osmosis auto-detects whether to produce Fusion-compatible output:
 
-1. **Known Fusion manifest** — if `target/manifest.json` contains known Fusion manifest evidence (for example schema v20), fusion-compat is enabled. This check reads the manifest before osmosis re-parses the project, since parsing via dbt-core overwrites it with a dbt-core manifest.
+1. **dbt v2 manifest** — if `target/manifest.json` was written by the dbt v2 engine, fusion-compat is enabled. dbt-osmosis treats a `metadata.dbt_version` of 2.0 or later as v2 evidence, which covers `dbt` and `dbt OSS` (formerly Fusion and dbt Core v2) and earlier Fusion previews. It also accepts the Fusion preview manifest schema v20. A truncated or otherwise invalid manifest doesn't count, so if a dbt v2 run was interrupted while writing it, rerun `dbt parse` with dbt v2 or pass `--fusion-compat`. This check reads the manifest before osmosis re-parses the project, since parsing via dbt-core overwrites it with a dbt-core manifest.
 2. **dbt-core version** — if dbt-core >= 1.9.6 is installed, fusion-compat is enabled (these versions natively support the `config` block format).
 
 ### Explicit override
@@ -122,11 +122,11 @@ dbt-osmosis yaml refactor --no-fusion-compat
 
 ### Hybrid workflow for Fusion projects
 
-If your team is testing dbt Fusion alongside dbt-core:
+If your team runs dbt v2 (formerly dbt Fusion) alongside dbt-core:
 
-1. Maintain **two virtual environments** — one with `dbt-core` + `dbt-osmosis`, another with `dbt-fusion`.
-2. Run dbt Fusion for compilation and execution in your normal workflow.
-3. Run dbt-osmosis from the dbt-core environment to manage YAML schema files. Osmosis will detect known Fusion manifest evidence and automatically produce compatible output.
+1. Maintain **two virtual environments** — one with `dbt-core` + `dbt-osmosis`, another with dbt v2 (`dbt` or `dbt-oss`).
+2. Run dbt v2 for compilation and execution in your normal workflow.
+3. Run dbt-osmosis from the dbt-core environment to manage YAML schema files. Osmosis will detect the dbt v2 manifest in `target/` and automatically produce compatible output.
 4. Both environments can share the same `dbt_project.yml` and model files.
 
 ## Behavior settings
