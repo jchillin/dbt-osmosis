@@ -128,7 +128,7 @@ Fusion-compatible output covers the columns dbt-osmosis writes. dbt-osmosis does
 
 By default (`--fusion-compat` not specified), dbt-osmosis auto-detects whether to produce Fusion-compatible output:
 
-1. **dbt v2 manifest** — if `target/manifest.json` was written by the dbt v2 engine, fusion-compat is enabled. dbt-osmosis treats a `metadata.dbt_version` of 2.0 or later as v2 evidence, which covers `dbt` and `dbt OSS` (formerly Fusion and dbt Core v2) and earlier Fusion previews. It also accepts the Fusion preview manifest schema v20. A truncated or otherwise invalid manifest doesn't count, so if a dbt v2 run was interrupted while writing it, rerun `dbt parse` with dbt v2 or pass `--fusion-compat`. When dbt-osmosis finds a dbt v2 manifest, it still parses the project with dbt-core but leaves that manifest in place, so dbt v2 state selection and deferral keep working.
+1. **dbt v2 manifest** — if `manifest.json` in the project's target directory was written by the dbt v2 engine, fusion-compat is enabled. The target directory is `target/` unless `target-path` in `dbt_project.yml` says otherwise. dbt-osmosis treats a `metadata.dbt_version` of 2.0 or later as v2 evidence, which covers `dbt` and `dbt OSS` (formerly Fusion and dbt Core v2) and earlier Fusion previews. It also accepts the Fusion preview manifest schema v20. A truncated or otherwise invalid manifest doesn't count, so if a dbt v2 run was interrupted while writing it, rerun `dbt parse` with dbt v2 or pass `--fusion-compat`. When dbt-osmosis finds a dbt v2 manifest, it still parses the project with dbt-core but leaves that manifest in place, so dbt v2 state selection and deferral keep working.
 2. **dbt-core version** — if dbt-core >= 1.9.6 is installed, fusion-compat is enabled (these versions natively support the `config` block format).
 
 ### Explicit override
@@ -149,12 +149,12 @@ If your team runs dbt v2 (formerly dbt Fusion) alongside dbt-core:
 2. Migrate the project once with `dbt-autofix deprecations --all`. It moves `+dbt-osmosis` routing and SQL `dbt_osmosis_*` options under `meta` (see [routing that dbt v2 accepts](#fusion-compatible-routing-via-vars)), moves model and seed properties such as `meta` under `config`, and nests generic test arguments under `arguments:`.
 3. Use dbt-core 1.10.5 or later in the dbt-osmosis environment. Earlier versions can't parse generic test `arguments:`.
 4. Run dbt v2 for compilation and execution in your normal workflow.
-5. Run dbt-osmosis from the dbt-core environment to manage YAML schema files. It detects the dbt v2 manifest in `target/`, produces compatible output, and leaves that manifest in place. Its dbt-core parse still writes `partial_parse.msgpack` to `target/`, and dbt v2 parses and builds normally with that file present.
+5. Run dbt-osmosis from the dbt-core environment to manage YAML schema files. It detects the dbt v2 manifest in the target directory, produces compatible output, and leaves that manifest in place, including when you switch targets in the workbench. Its dbt-core parse still writes `partial_parse.msgpack` there, and dbt v2 parses and builds normally with that file present.
 6. Check the result with `dbt parse` from the dbt v2 environment.
 
 Both environments share the same `dbt_project.yml` and model files. The dbt-osmosis CI runs these steps on the demo project with `dbt-oss` and dbt-core 1.12.
 
-Switching targets in the workbench re-parses through dbt-core-interface, which always writes `target/manifest.json`. If you use the workbench on a dbt v2 project, rerun `dbt parse` with dbt v2 afterwards.
+dbt-osmosis follows `target-path` in `dbt_project.yml`, but not the `DBT_TARGET_PATH` environment variable. If dbt v2 writes its manifest somewhere else because of that variable, dbt-osmosis never touches that file. It writes its own manifest to `target/` and falls back to the dbt-core version check for fusion-compat, which dbt-core 1.10.5 or later passes.
 
 ## Behavior settings
 
