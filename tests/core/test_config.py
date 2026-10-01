@@ -1,21 +1,25 @@
 # pyright: reportPrivateImportUsage=false, reportPrivateUsage=false, reportUnknownParameterType=false, reportMissingParameterType=false, reportAny=false, reportUnknownMemberType=false, reportUnknownArgumentType=false, reportArgumentType=false, reportFunctionMemberAccess=false, reportUnknownVariableType=false, reportUnusedParameter=false
 
+import gc
 import json
 import os
 import threading
 import time
+import weakref
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
 import pytest
+import ruamel.yaml
 
 from dbt_osmosis.core.config import (
     _MANIFEST_HEAD_CHARS,
     DbtConfiguration,
     _add_cross_project_references,
     _detect_fusion_manifest,
+    _guard_dbt_v2_manifest,
     _reload_manifest,
     config_to_namespace,
     create_dbt_project_context,
@@ -27,6 +31,8 @@ from tests.support import create_temp_project_copy
 
 _V12_SCHEMA_URL = "https://schemas.getdbt.com/dbt/manifest/v12.json"
 _NODES_PAST_READ_WINDOW = {"model.demo.big": {"description": "x" * (_MANIFEST_HEAD_CHARS + 1)}}
+_METADATA_ENV_PAST_READ_WINDOW = {"DBT_ENV_CUSTOM_ENV_NOTES": "x" * (_MANIFEST_HEAD_CHARS + 1)}
+_V2_MANIFEST = {"metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "2.0.5"}}
 _LARGE_V2_MANIFEST_TEXT = json.dumps({
     "metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "2.0.5"},
     "nodes": _NODES_PAST_READ_WINDOW,
@@ -119,6 +125,7 @@ def test_create_dbt_project_context_accepts_interface_registered_adapter():
         ),
         manifest=mock.Mock(),
         project_name="demo_duckdb",
+        target_path=Path("demo_duckdb/target"),
     )
     factory = SimpleNamespace(adapters={"duckdb": adapter})
     context = mock.sentinel.context
@@ -126,7 +133,7 @@ def test_create_dbt_project_context_accepts_interface_registered_adapter():
     with (
         mock.patch("dbt.adapters.factory.FACTORY", factory),
         mock.patch("dbt_osmosis.core.config._detect_fusion_manifest", return_value=False),
-        mock.patch("dbt_osmosis.core.config.InterfaceDbtProject.from_config", return_value=project),
+        mock.patch("dbt_osmosis.core.config._load_interface_project", return_value=project),
         mock.patch("dbt_osmosis.core.config.DbtProjectContext.from_project", return_value=context),
         mock.patch("dbt_osmosis.core.config.importlib.import_module", side_effect=ImportError),
     ):
@@ -146,13 +153,14 @@ def test_create_dbt_project_context_registers_project_adapter_when_factory_missi
         ),
         manifest=mock.Mock(),
         project_name="demo_duckdb",
+        target_path=Path("demo_duckdb/target"),
     )
     factory = SimpleNamespace(adapters={})
 
     with (
         mock.patch("dbt.adapters.factory.FACTORY", factory),
         mock.patch("dbt_osmosis.core.config._detect_fusion_manifest", return_value=False),
-        mock.patch("dbt_osmosis.core.config.InterfaceDbtProject.from_config", return_value=project),
+        mock.patch("dbt_osmosis.core.config._load_interface_project", return_value=project),
         mock.patch(
             "dbt_osmosis.core.config.DbtProjectContext.from_project",
             return_value=mock.sentinel.context,
@@ -177,13 +185,14 @@ def test_create_dbt_project_context_replaces_stale_factory_adapter():
         ),
         manifest=mock.Mock(),
         project_name="demo_duckdb",
+        target_path=Path("demo_duckdb/target"),
     )
     factory = SimpleNamespace(adapters={"duckdb": registered_adapter})
 
     with (
         mock.patch("dbt.adapters.factory.FACTORY", factory),
         mock.patch("dbt_osmosis.core.config._detect_fusion_manifest", return_value=False),
-        mock.patch("dbt_osmosis.core.config.InterfaceDbtProject.from_config", return_value=project),
+        mock.patch("dbt_osmosis.core.config._load_interface_project", return_value=project),
         mock.patch(
             "dbt_osmosis.core.config.DbtProjectContext.from_project",
             return_value=mock.sentinel.context,
@@ -209,13 +218,14 @@ def test_create_dbt_project_context_falls_back_to_close_all_connections():
         ),
         manifest=mock.Mock(),
         project_name="demo_duckdb",
+        target_path=Path("demo_duckdb/target"),
     )
     factory = SimpleNamespace(adapters={"duckdb": registered_adapter})
 
     with (
         mock.patch("dbt.adapters.factory.FACTORY", factory),
         mock.patch("dbt_osmosis.core.config._detect_fusion_manifest", return_value=False),
-        mock.patch("dbt_osmosis.core.config.InterfaceDbtProject.from_config", return_value=project),
+        mock.patch("dbt_osmosis.core.config._load_interface_project", return_value=project),
         mock.patch(
             "dbt_osmosis.core.config.DbtProjectContext.from_project",
             return_value=mock.sentinel.context,
@@ -241,13 +251,14 @@ def test_create_dbt_project_context_rebinds_when_stale_adapter_has_no_cleanup_ho
         ),
         manifest=mock.Mock(),
         project_name="demo_duckdb",
+        target_path=Path("demo_duckdb/target"),
     )
     factory = SimpleNamespace(adapters={"duckdb": registered_adapter})
 
     with (
         mock.patch("dbt.adapters.factory.FACTORY", factory),
         mock.patch("dbt_osmosis.core.config._detect_fusion_manifest", return_value=False),
-        mock.patch("dbt_osmosis.core.config.InterfaceDbtProject.from_config", return_value=project),
+        mock.patch("dbt_osmosis.core.config._load_interface_project", return_value=project),
         mock.patch(
             "dbt_osmosis.core.config.DbtProjectContext.from_project",
             return_value=mock.sentinel.context,
@@ -350,11 +361,11 @@ class TestDetectFusionManifest:
         target = tmp_path / "target"
         target.mkdir()
         (target / "manifest.json").write_text(manifest_text)
-        return _detect_fusion_manifest(str(tmp_path))
+        return _detect_fusion_manifest(tmp_path / "target" / "manifest.json")
 
     def test_no_manifest_returns_false(self, tmp_path):
         """Without a manifest, there is no project-local Fusion evidence."""
-        assert _detect_fusion_manifest(str(tmp_path)) is False
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is False
 
     def test_no_manifest_ignores_fusion_binaries_on_path(self, tmp_path):
         """Installed Fusion binaries alone are not evidence about this project."""
@@ -368,7 +379,7 @@ class TestDetectFusionManifest:
                 else None
             ),
         ) as mock_which:
-            assert _detect_fusion_manifest(str(tmp_path)) is False
+            assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is False
         mock_which.assert_not_called()
 
     def test_dbt_core_manifest_v12(self, tmp_path):
@@ -382,7 +393,7 @@ class TestDetectFusionManifest:
             },
         }
         (target / "manifest.json").write_text(json.dumps(manifest))
-        assert _detect_fusion_manifest(str(tmp_path)) is False
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is False
 
     def test_fusion_manifest_v20(self, tmp_path):
         """Fusion manifest (v20) → returns True."""
@@ -395,7 +406,7 @@ class TestDetectFusionManifest:
             },
         }
         (target / "manifest.json").write_text(json.dumps(manifest))
-        assert _detect_fusion_manifest(str(tmp_path)) is True
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is True
 
     def test_dbt_v2_ga_manifest_v12(self, tmp_path):
         """dbt v2 GA manifest (schema v12, dbt_version 2.x, compact JSON) → returns True."""
@@ -410,7 +421,7 @@ class TestDetectFusionManifest:
             "nodes": {},
         }
         (target / "manifest.json").write_text(json.dumps(manifest, separators=(",", ":")))
-        assert _detect_fusion_manifest(str(tmp_path)) is True
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is True
 
     @pytest.mark.parametrize("dbt_version", ["2.0.0-rc8", "2.0.0-preview.154"])
     def test_dbt_v2_prerelease_manifest(self, tmp_path, dbt_version):
@@ -424,7 +435,7 @@ class TestDetectFusionManifest:
             },
         }
         (target / "manifest.json").write_text(json.dumps(manifest))
-        assert _detect_fusion_manifest(str(tmp_path)) is True
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is True
 
     @pytest.mark.parametrize("dbt_version", ["1.10.20", "1.12.0b2"])
     def test_dbt_core_v1_manifest_versions(self, tmp_path, dbt_version):
@@ -438,7 +449,7 @@ class TestDetectFusionManifest:
             },
         }
         (target / "manifest.json").write_text(json.dumps(manifest))
-        assert _detect_fusion_manifest(str(tmp_path)) is False
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is False
 
     def test_dbt_v2_manifest_larger_than_read_window(self, tmp_path):
         """A valid v2 manifest larger than the metadata read window → returns True."""
@@ -448,6 +459,32 @@ class TestDetectFusionManifest:
         """Without v2 evidence in metadata, the rest of the manifest is never read."""
         manifest = {
             "metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "1.11.2"},
+            "nodes": _NODES_PAST_READ_WINDOW,
+        }
+        with mock.patch("dbt_osmosis.core.config.validate_json_file") as validate:
+            assert self._detect(tmp_path, json.dumps(manifest)) is False
+        validate.assert_not_called()
+
+    def test_dbt_v2_metadata_larger_than_read_window(self, tmp_path):
+        """A valid v2 manifest whose metadata alone outgrows the read window → returns True."""
+        manifest = {
+            "metadata": {
+                "dbt_schema_version": _V12_SCHEMA_URL,
+                "dbt_version": "2.0.5",
+                "env": _METADATA_ENV_PAST_READ_WINDOW,
+            },
+            "nodes": {},
+        }
+        assert self._detect(tmp_path, json.dumps(manifest)) is True
+
+    def test_dbt_core_metadata_larger_than_read_window(self, tmp_path):
+        """dbt-core metadata that outgrows the read window still isn't v2 evidence."""
+        manifest = {
+            "metadata": {
+                "dbt_schema_version": _V12_SCHEMA_URL,
+                "dbt_version": "1.11.2",
+                "env": _METADATA_ENV_PAST_READ_WINDOW,
+            },
             "nodes": _NODES_PAST_READ_WINDOW,
         }
         with mock.patch("dbt_osmosis.core.config.validate_json_file") as validate:
@@ -541,21 +578,21 @@ class TestDetectFusionManifest:
             },
         }
         (target / "manifest.json").write_text(json.dumps(manifest))
-        assert _detect_fusion_manifest(str(tmp_path)) is False
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is False
 
     def test_malformed_manifest(self, tmp_path):
         """Malformed manifest.json → returns False gracefully."""
         target = tmp_path / "target"
         target.mkdir()
         (target / "manifest.json").write_text("not valid json{{{")
-        assert _detect_fusion_manifest(str(tmp_path)) is False
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is False
 
     def test_manifest_missing_metadata(self, tmp_path):
         """Manifest with no metadata section → returns False."""
         target = tmp_path / "target"
         target.mkdir()
         (target / "manifest.json").write_text(json.dumps({"nodes": {}}))
-        assert _detect_fusion_manifest(str(tmp_path)) is False
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is False
 
     def test_manifest_empty_schema_version(self, tmp_path):
         """Manifest with empty dbt_schema_version → returns False."""
@@ -563,36 +600,78 @@ class TestDetectFusionManifest:
         target.mkdir()
         manifest = {"metadata": {"dbt_schema_version": ""}}
         (target / "manifest.json").write_text(json.dumps(manifest))
-        assert _detect_fusion_manifest(str(tmp_path)) is False
+        assert _detect_fusion_manifest(tmp_path / "target" / "manifest.json") is False
+
+
+class _RecordingProject:
+    def __init__(self, target_path: Path) -> None:
+        self.target_path = target_path
+        self.writes: list[object] = []
+
+    def write_manifest(self, path=None) -> None:
+        self.writes.append(path)
+
+
+class TestGuardDbtV2Manifest:
+    """_guard_dbt_v2_manifest() only skips writes that would replace a dbt v2 manifest."""
+
+    @staticmethod
+    def _guarded_project(tmp_path: Path, manifest: dict[str, object]) -> _RecordingProject:
+        target = tmp_path / "target"
+        target.mkdir()
+        (target / "manifest.json").write_text(json.dumps(manifest))
+        project = _RecordingProject(target)
+        _guard_dbt_v2_manifest(project)
+        return project
+
+    def test_skips_default_write_over_dbt_v2_manifest(self, tmp_path):
+        project = self._guarded_project(tmp_path, _V2_MANIFEST)
+        project.write_manifest()
+        assert project.writes == []
+
+    def test_writes_over_dbt_core_manifest_when_guarded_twice(self, tmp_path):
+        project = self._guarded_project(
+            tmp_path, {"metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "1.11.2"}}
+        )
+        guarded_write = vars(project)["write_manifest"]
+        _guard_dbt_v2_manifest(project)
+        assert vars(project)["write_manifest"] is guarded_write
+        project.write_manifest()
+        assert project.writes == [None]
+
+    def test_writes_explicit_path(self, tmp_path):
+        project = self._guarded_project(tmp_path, _V2_MANIFEST)
+        project.write_manifest("elsewhere")
+        assert project.writes == ["elsewhere"]
 
 
 class TestProjectContextManifestWrite:
-    """create_dbt_project_context() parses with dbt-core; these cover what it leaves in target/."""
+    """create_dbt_project_context() parses with dbt-core; these cover what it leaves in the target directory."""
 
     @staticmethod
-    def _demo_project_with_manifest(tmp_path: Path, manifest: dict[str, object]) -> Path:
+    def _demo_project_with_manifest(
+        tmp_path: Path, manifest: dict[str, object], target_dir: str = "target"
+    ) -> Path:
         project_dir = create_temp_project_copy(Path("demo_duckdb"), tmp_path)
-        manifest_path = project_dir / "target" / "manifest.json"
+        manifest_path = project_dir / target_dir / "manifest.json"
         manifest_path.parent.mkdir()
         manifest_path.write_text(json.dumps(manifest))
         return project_dir
 
     @staticmethod
-    def _create_context(project_dir: Path):
+    def _create_context(project_dir: Path, **config: object):
         return create_dbt_project_context(
             DbtConfiguration(
                 project_dir=str(project_dir),
                 profiles_dir=str(project_dir),
                 target="test",
+                **config,
             )
         )
 
     def test_keeps_dbt_v2_manifest(self, tmp_path):
         """dbt v2 reads target/manifest.json for state and deferral, so osmosis must not replace it."""
-        project_dir = self._demo_project_with_manifest(
-            tmp_path,
-            {"metadata": {"dbt_schema_version": _V12_SCHEMA_URL, "dbt_version": "2.0.5"}},
-        )
+        project_dir = self._demo_project_with_manifest(tmp_path, _V2_MANIFEST)
         manifest_path = project_dir / "target" / "manifest.json"
         v2_manifest = manifest_path.read_bytes()
 
@@ -601,6 +680,63 @@ class TestProjectContextManifestWrite:
             assert "model.jaffle_shop_duckdb.orders" in context.manifest.nodes
 
         assert manifest_path.read_bytes() == v2_manifest
+
+    def test_keeps_dbt_v2_manifest_when_project_is_reused_with_new_vars(self, tmp_path):
+        """dbt-core-interface reuses a live project for the same root and re-parses it when vars change."""
+        project_dir = self._demo_project_with_manifest(tmp_path, _V2_MANIFEST)
+        manifest_path = project_dir / "target" / "manifest.json"
+        v2_manifest = manifest_path.read_bytes()
+        model = project_dir / "models" / "orders.sql"
+
+        with self._create_context(project_dir) as first_context:
+            model.write_text(model.read_text() + "\n-- edited so the re-parse isn't skipped\n")
+            with self._create_context(project_dir, vars={"review_marker": True}) as context:
+                assert context.is_fusion_manifest is True
+                assert context._project is first_context._project
+
+        assert manifest_path.read_bytes() == v2_manifest
+
+    def test_project_is_freed_with_its_last_context(self, tmp_path):
+        """The guard mustn't keep a project alive, or dbt-core-interface would reuse it instead of parsing anew."""
+        project_dir = self._demo_project_with_manifest(tmp_path, _V2_MANIFEST)
+        gc.disable()
+        try:
+            context = self._create_context(project_dir)
+            project_ref = weakref.ref(context._project)
+            context.close()
+            del context
+            assert project_ref() is None
+        finally:
+            gc.enable()
+
+    def test_keeps_dbt_v2_manifest_in_configured_target_path(self, tmp_path):
+        """Detection and the write both use target-path from dbt_project.yml."""
+        project_dir = self._demo_project_with_manifest(tmp_path, _V2_MANIFEST, "artifacts")
+        project_yml = project_dir / "dbt_project.yml"
+        yaml = ruamel.yaml.YAML()
+        project_config = yaml.load(project_yml)
+        project_config["target-path"] = "artifacts"
+        yaml.dump(project_config, project_yml)
+        manifest_path = project_dir / "artifacts" / "manifest.json"
+        v2_manifest = manifest_path.read_bytes()
+
+        with self._create_context(project_dir) as context:
+            assert context.is_fusion_manifest is True
+
+        assert manifest_path.read_bytes() == v2_manifest
+
+    def test_ignores_dbt_target_path_environment_variable(self, tmp_path, monkeypatch):
+        """dbt-core-interface ignores DBT_TARGET_PATH, so a dbt v2 manifest there is out of reach."""
+        project_dir = self._demo_project_with_manifest(tmp_path, _V2_MANIFEST, "artifacts")
+        monkeypatch.setenv("DBT_TARGET_PATH", str(project_dir / "artifacts"))
+        manifest_path = project_dir / "artifacts" / "manifest.json"
+        v2_manifest = manifest_path.read_bytes()
+
+        with self._create_context(project_dir) as context:
+            assert context.is_fusion_manifest is False
+
+        assert manifest_path.read_bytes() == v2_manifest
+        assert (project_dir / "target" / "manifest.json").is_file()
 
     def test_replaces_dbt_core_manifest(self, tmp_path):
         """Without dbt v2 evidence, osmosis still writes its fresh dbt-core manifest."""

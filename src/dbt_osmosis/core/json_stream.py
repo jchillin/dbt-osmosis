@@ -1,8 +1,10 @@
-"""Bounded-memory validation of large JSON files.
+"""Bounded-memory reading and validation of large JSON files.
 
 ``json.load`` builds the whole document in memory, which for a 100MB+ dbt
 manifest costs several times the file size. ``validate_json_file`` checks the
 same thing while holding only one chunk of text and one inner value at a time.
+``read_first_member`` decodes the leading member of an object, such as a
+manifest's ``metadata``, and stops reading where that value ends.
 """
 
 from __future__ import annotations
@@ -12,7 +14,7 @@ import re
 import typing as t
 from pathlib import Path
 
-__all__ = ["validate_json_file"]
+__all__ = ["read_first_member", "validate_json_file"]
 
 _DEFAULT_CHUNK_CHARS = 1024 * 1024
 # Containers in the two outermost levels are walked piece by piece. Anything
@@ -138,3 +140,35 @@ def validate_json_file(path: Path | str, *, chunk_chars: int = _DEFAULT_CHUNK_CH
         _skip_value(reader, _WALK_DEPTH)
         if reader.peek():
             raise ValueError("Extra data after the JSON value")
+
+
+def read_first_member(
+    path: Path | str, key: str, *, chunk_chars: int = _DEFAULT_CHUNK_CHARS
+) -> object:
+    """Decode the value of ``key`` when it is the first member of the top-level object.
+
+    Reading stops where that value ends, so the rest of the file is neither
+    read nor checked. Memory stays around one chunk plus the value. A value
+    that is malformed partway through can grow the buffer to the rest of the
+    file before the error surfaces.
+
+    Args:
+        path: The file to read.
+        key: The key the first member must have.
+        chunk_chars: How many characters to read at a time.
+
+    Returns:
+        The decoded value, or None if the file doesn't hold an object whose first key is ``key``.
+
+    Raises:
+        OSError: If the file can't be read.
+        ValueError: If the file isn't UTF-8, or the first member is cut off or invalid JSON.
+    """
+    with open(path, encoding="utf-8") as f:
+        reader = _ChunkedJsonReader(f, chunk_chars)
+        if not reader.take("{") or reader.peek() != '"':
+            return None
+        if reader.decode_value() != key:
+            return None
+        reader.expect(":")
+        return reader.decode_value()

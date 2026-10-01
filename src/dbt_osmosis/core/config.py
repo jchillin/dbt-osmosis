@@ -9,12 +9,12 @@ from __future__ import annotations
 
 import argparse
 import importlib
-import json
 import os
 import re
 import threading
 import time
 import typing as t
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import get_ident
@@ -33,7 +33,7 @@ from packaging.version import parse as parse_version
 from typing_extensions import Self
 
 from dbt_osmosis.core import logger
-from dbt_osmosis.core.json_stream import validate_json_file
+from dbt_osmosis.core.json_stream import read_first_member, validate_json_file
 
 # Import dbt version for compatibility checking
 # Use a try/except in case the version module structure changes
@@ -56,10 +56,9 @@ except (ImportError, AttributeError):
 _SCHEMA_VERSION_RE = re.compile(r"/v(\d+)(?:\.json)?$")
 _KNOWN_FUSION_MANIFEST_SCHEMA_VERSIONS = {20}
 _MIN_RUST_ENGINE_MAJOR_VERSION = 2
-# Full manifests can be 100MB+, so detection reads a bounded prefix. The whole
-# metadata object has to fit inside it.
+# Full manifests can be 100MB+, so detection reads them in chunks of this size
+# and stops at the end of the leading metadata object unless it shows v2 evidence.
 _MANIFEST_HEAD_CHARS = 64 * 1024
-_LEADING_METADATA_KEY_RE = re.compile(r'\s*\{\s*"metadata"\s*:\s*')
 
 
 def _set_project_manifest(project: InterfaceDbtProject, manifest: Manifest) -> None:
@@ -100,32 +99,6 @@ def _cleanup_stale_adapter(registered_adapter: object, adapter_type: str) -> Non
     )
 
 
-def _read_manifest_metadata(manifest_path: Path) -> object:
-    """Decode the ``metadata`` object at the start of a manifest from a bounded prefix.
-
-    dbt-core and dbt v2 both write ``metadata`` as the first top-level key, and
-    only that position is trusted. The object has to decode completely inside
-    the read window. The rest of the file is not checked here.
-
-    Args:
-        manifest_path: Path to a manifest.json file.
-
-    Returns:
-        The decoded ``metadata`` value, or None if the manifest doesn't start with one.
-
-    Raises:
-        OSError: If the file can't be read.
-        ValueError: If the prefix isn't UTF-8 or the metadata object is invalid JSON.
-    """
-    with open(manifest_path, encoding="utf-8") as f:
-        head = f.read(_MANIFEST_HEAD_CHARS)
-
-    leading_key = _LEADING_METADATA_KEY_RE.match(head)
-    if leading_key is None:
-        return None
-    return t.cast(object, json.JSONDecoder().raw_decode(head, leading_key.end())[0])
-
-
 def _major_version(value: object) -> int | None:
     """Return the major version of a PEP 440 version string, or None if ``value`` isn't one."""
     if not isinstance(value, str):
@@ -164,42 +137,54 @@ def _rust_engine_manifest_evidence(metadata: object) -> str | None:
     return None
 
 
-def _detect_fusion_manifest(project_dir: str) -> bool:
-    """Check if the target directory contains a manifest produced by the dbt v2 engine.
+def _manifest_file_evidence(manifest_path: Path) -> str | None:
+    """Describe what in a manifest file proves the dbt v2 Rust engine wrote it.
+
+    dbt-core and dbt v2 both write ``metadata`` as the first top-level key, and
+    only that position is trusted. Only ``metadata`` is read unless it shows v2
+    evidence; then the whole file must also be valid JSON.
+
+    Args:
+        manifest_path: Path to a manifest.json file, which may not exist.
+
+    Returns:
+        A short description of the evidence, or None if the file is missing,
+        incomplete, or shows none.
+    """
+    if not manifest_path.exists():
+        # PATH contents are not project evidence: a globally installed Fusion binary
+        # does not mean this project was parsed with Fusion.
+        return None
+
+    try:
+        metadata = read_first_member(manifest_path, "metadata", chunk_chars=_MANIFEST_HEAD_CHARS)
+        evidence = _rust_engine_manifest_evidence(metadata)
+        if evidence is not None:
+            validate_json_file(manifest_path)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(":information_source: Could not check manifest for Fusion: %s", e)
+        return None
+    return evidence
+
+
+def _detect_fusion_manifest(manifest_path: Path) -> bool:
+    """Check if a project's manifest was produced by the dbt v2 engine.
 
     dbt v2 is the Rust engine distributed as ``dbt`` and ``dbt OSS`` (formerly
     dbt Fusion and dbt Core v2). When teams run it side by side with a dbt-core
     environment for dbt-osmosis, this detection ensures dbt-osmosis outputs
     Fusion-compatible YAML even if the installed dbt-core is older.
 
-    The check runs before osmosis re-parses the project with dbt-core. When it
-    returns True, that parse leaves the manifest in place for dbt v2. Only the
-    leading metadata is read unless it shows v2 evidence; then the whole file
-    must also be valid JSON.
-
     Args:
-        project_dir: Path to the dbt project root.
+        manifest_path: The manifest.json in the project's target directory.
 
     Returns:
         True if an existing, complete manifest proves the project was last parsed by the dbt v2 engine.
     """
-    manifest_path = Path(project_dir) / "target" / "manifest.json"
-    if not manifest_path.exists():
-        # PATH contents are not project evidence: a globally installed Fusion binary
-        # does not mean this project was parsed with Fusion.
-        return False
-
-    try:
-        evidence = _rust_engine_manifest_evidence(_read_manifest_metadata(manifest_path))
-        if evidence is not None:
-            validate_json_file(manifest_path)
-    except Exception as e:  # noqa: BLE001
-        logger.debug(":information_source: Could not check manifest for Fusion: %s", e)
-        return False
-
+    evidence = _manifest_file_evidence(manifest_path)
     if evidence is None:
         logger.debug(
-            ":information_source: Manifest at %s shows no dbt v2 engine evidence; %s",
+            ":information_source: No dbt v2 engine manifest at %s; %s",
             manifest_path,
             "leaving fusion_compat auto-detection to dbt version or explicit override",
         )
@@ -698,30 +683,59 @@ def _bind_project_adapter(project: InterfaceDbtProject) -> None:
         )
 
 
-def _load_interface_project(
-    interface_config: InterfaceDbtConfiguration,
-    *,
-    write_manifest: bool,
-) -> InterfaceDbtProject:
-    """Create and parse the dbt-core-interface project.
+def _guard_dbt_v2_manifest(project: InterfaceDbtProject) -> None:
+    """Stop a dbt-core-interface project from replacing a dbt v2 manifest.
+
+    dbt-core-interface writes ``manifest.json`` to the target directory after
+    it parses: on first load, and again whenever a live project for the same
+    root is reused with a different target, profile, or vars. In a hybrid
+    project that file belongs to dbt v2, which reads it for state selection
+    and deferral. ``DbtProject`` is final and has no option to skip the write,
+    so this shadows ``write_manifest`` on the instance, for as long as it lives.
+    Writes to an explicit path are left alone.
+
+    Args:
+        project: The project to guard. Guarding it again does nothing.
+    """
+    if "write_manifest" in vars(project):
+        return
+    # A strong reference would keep the project alive after its last user lets
+    # go, and dbt-core-interface would then hand it back instead of parsing anew.
+    project_ref = weakref.ref(project)
+    write_unguarded = type(project).write_manifest
+
+    def write_manifest(path: Path | str | None = None) -> None:
+        guarded = t.cast(InterfaceDbtProject, project_ref())
+        if path is None:
+            manifest_path = guarded.target_path / "manifest.json"
+            evidence = _manifest_file_evidence(manifest_path)
+            if evidence is not None:
+                logger.info(
+                    ":lock: Leaving the dbt v2 manifest at %s in place (%s)",
+                    manifest_path,
+                    evidence,
+                )
+                return
+        write_unguarded(guarded, path)
+
+    object.__setattr__(project, "write_manifest", write_manifest)
+
+
+def _load_interface_project(interface_config: InterfaceDbtConfiguration) -> InterfaceDbtProject:
+    """Create or reuse the parsed dbt-core-interface project, with its dbt v2 manifest guarded.
+
+    Behaves like ``DbtProject.from_config()``, except that the guard is in
+    place before a new project's first parse. A live project for the same
+    root is reused, and dbt-core-interface re-parses it if the target,
+    profile, or vars changed. One that dbt-osmosis didn't create is only
+    guarded after that re-parse.
 
     Args:
         interface_config: The dbt-core-interface configuration.
-        write_manifest: Whether dbt-core may write the parsed manifest to
-            ``target/manifest.json``. Pass False when that file belongs to
-            dbt v2, which reads it for state selection and deferral. This
-            only covers the initial parse: when dbt-core-interface reuses a
-            project for the same root with a different target, profile, or
-            vars, its ``DbtProject.args`` setter re-parses and writes anyway.
 
     Returns:
         The parsed project.
-
     """
-    if write_manifest:
-        return InterfaceDbtProject.from_config(interface_config)
-
-    logger.info(":lock: Leaving the dbt v2 target/manifest.json in place")
     project = InterfaceDbtProject(
         target=interface_config.target,
         profiles_dir=interface_config.profiles_dir,
@@ -731,7 +745,9 @@ def _load_interface_project(
         profile=interface_config.profile,
         load=False,
     )
-    project.parse_project(write_manifest=False)
+    _guard_dbt_v2_manifest(project)
+    # Parses, and writes through the guard, only if this project hasn't parsed yet.
+    _ = project.manifest
     return project
 
 
@@ -750,11 +766,10 @@ def create_dbt_project_context(config: DbtConfiguration) -> DbtProjectContext:
     """
     logger.info(":wave: Creating DBT project context using config => %s", config)
 
-    # Check for a dbt v2 manifest before parsing, so teams running dbt v2
-    # alongside dbt-core get fusion_compat=True automatically.
-    is_fusion = _detect_fusion_manifest(config.project_dir)
-
-    project = _load_interface_project(config.to_interface_config(), write_manifest=not is_fusion)
+    project = _load_interface_project(config.to_interface_config())
+    # The guarded parse can't have replaced a dbt v2 manifest, so this still
+    # sees what dbt v2 left, at the path dbt-core writes to.
+    is_fusion = _detect_fusion_manifest(project.target_path / "manifest.json")
     _bind_project_adapter(project)
 
     # Handle dbt-loom cross-project references if available

@@ -3,5 +3,6 @@ body: |-
     Detect dbt v2 manifests when auto-enabling fusion-compat output.
 
     - dbt v2 (`dbt` and `dbt OSS`) writes manifest schema v12, so the previous schema-v20-only check missed it. A `metadata.dbt_version` of 2.0 or later now counts as v2 evidence, as long as the whole manifest is valid JSON.
+    - Detection reads the manifest in the project's target directory, honoring `target-path` in `dbt_project.yml`, and reads its `metadata` in full however large it is.
     - Hybrid setups that run dbt-osmosis on dbt-core older than 1.9.6 next to a dbt v2 project now get Fusion-compatible YAML without passing `--fusion-compat`.
 time: 2026-09-29T21:09:23Z
